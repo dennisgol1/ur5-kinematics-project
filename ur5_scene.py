@@ -150,8 +150,13 @@ def place_robot_on_desk(
 # ---------------------------------------------------------------------------
 # Viewport camera — close-up of the desk + UR5
 # ---------------------------------------------------------------------------
-DEFAULT_CAMERA_EYE:    tuple[float, float, float] = (1.00, -0.80, 1.10)
-DEFAULT_CAMERA_TARGET: tuple[float, float, float] = (0.40,  0.00, 0.90)
+# Matches the matplotlib dashboard's 3-D panel (elev=30 deg, azim=-60 deg).
+# Camera direction from target toward eye:
+#     ( cos(30) cos(-60), cos(30) sin(-60), sin(30) )
+#   = ( +0.433, -0.750, +0.500 )
+# At distance D = 0.85 m from the desk-top centre.
+DEFAULT_CAMERA_EYE:    tuple[float, float, float] = (0.77, -0.64, 1.18)
+DEFAULT_CAMERA_TARGET: tuple[float, float, float] = (0.40,  0.00, 0.75)
 
 
 def set_camera_view(
