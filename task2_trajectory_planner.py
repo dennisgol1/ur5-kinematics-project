@@ -22,6 +22,22 @@ Run:
     python3 task2_trajectory_planner.py
 
 No Isaac Sim required — only numpy and matplotlib.
+
+Run options
+-----------
+If the system Python complains about a numpy/matplotlib ABI mismatch
+(``ImportError: numpy.core.multiarray failed to import``), pick one of:
+
+  1. Use Isaac Sim's bundled Python — its matplotlib + numpy are already
+     compatible::
+
+        /home/ubuntu/Simulators/isaacsim-6.0/python.sh \\
+            /home/ubuntu/ur5-kinematics-project/task2_trajectory_planner.py
+
+  2. Upgrade matplotlib in user-site so it picks up numpy 2.x ABI::
+
+        python3 -m pip install --user --upgrade matplotlib
+        python3 task2_trajectory_planner.py
 """
 from __future__ import annotations
 
@@ -274,7 +290,7 @@ def build_dashboard(
         rf"$\quad\mathbf{{P_f}}=({p_end[0]:.2f},\,{p_end[1]:.2f},\,{p_end[2]:.2f})\,\mathrm{{m}}$"
         rf"$\quad T={duration:.1f}\,\mathrm{{s}}$"
         rf"$\quad\|\Delta\mathbf{{P}}\|={distance:.3f}\,\mathrm{{m}}$"
-        rf"$\quad v_{{\max}}=\tfrac{{15}}{{8}}\,\|\Delta\mathbf{{P}}\|/T={1.875 * distance / duration:.3f}\,\mathrm{{m/s}}$"
+        rf"$\quad v_{{\max}}=\frac{{15}}{{8}}\,\|\Delta\mathbf{{P}}\|/T={1.875 * distance / duration:.3f}\,\mathrm{{m/s}}$"
     )
     equations = "\n".join([
         r"$\mathbf{Cartesian\ Path}:\quad "
@@ -282,12 +298,12 @@ def build_dashboard(
         r"\qquad\dot{\mathbf{P}}(t) = (\mathbf{P_f} - \mathbf{P_0})\,\dot{s}(t)$",
         r"$\mathbf{Quintic\ Blend}:\quad "
         r"s(\tau)=10\tau^3-15\tau^4+6\tau^5"
-        r"\qquad \dot{s}(\tau)=\tfrac{1}{T}\,(30\tau^2-60\tau^3+30\tau^4)"
+        r"\qquad \dot{s}(\tau)=\frac{1}{T}\,(30\tau^2-60\tau^3+30\tau^4)"
         r"\qquad \tau=t/T$",
         r"$\mathbf{Damped\ IK\ Update}:\quad "
-        r"\mathbf{q}_{k+1} = \mathbf{q}_k + \alpha\,J^{\mathsf{T}}\,"
-        r"\bigl(J\,J^{\mathsf{T}} + \lambda^{2} I\bigr)^{-1}"
-        r"\bigl[\mathbf{p}_{\mathrm{target}} - \mathrm{FK}(\mathbf{q}_k)\bigr]$",
+        r"\mathbf{q}_{k+1} = \mathbf{q}_k + \alpha\,J^{T}\,"
+        r"(J\,J^{T} + \lambda^{2}\,I)^{-1}\,"
+        r"[\mathbf{p}_{\mathrm{target}} - \mathrm{FK}(\mathbf{q}_k)]$",
         params_line,
     ])
     ax5.text(0.5, 0.5, equations, ha='center', va='center',
