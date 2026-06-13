@@ -370,146 +370,185 @@ def _make_textured_material(
     return material
 
 
-def _add_planar_st_primvar(
+def _build_textured_quad(
     stage,
-    cube_root_path: str,
-    repeat: tuple[float, float] = (1.0, 1.0),
-) -> None:
-    """Author an ``st`` primvar on every Mesh under ``cube_root_path``.
+    prim_path: str,
+    size: tuple[float, float],
+    z: float,
+    st_repeat: tuple[float, float],
+) -> UsdGeom.Mesh:
+    """Single flat ``UsdGeom.Mesh`` quad facing +Z with explicit UVs.
 
-    ``isaacsim.core.api.objects.FixedCuboid`` wraps ``UsdGeom.Cube`` (and
-    its tessellated Mesh proxy). The Mesh does not author ``st`` by
-    default, so Storm's ``UsdUVTexture`` cannot sample our texture.
-
-    This walks the prim tree, finds every Mesh, looks at its face counts
-    and authors a per-face-vertex constant tiling using the mesh's XY
-    bounds. ``repeat`` is how many times the texture tiles across the
-    object's footprint.
+    ``FixedCuboid`` wraps ``UsdGeom.Cube`` (a procedural primitive). The
+    Mesh that Storm renders for a Cube does not carry an ``st`` primvar,
+    so ``UsdUVTexture`` falls back to a constant zero coord and the
+    texture renders as a flat color. Building a real ``Mesh`` with
+    explicit ``st`` is the only reliable Storm path.
     """
-    root = stage.GetPrimAtPath(cube_root_path)
-    for prim in Usd.PrimRange(root):
-        if prim.GetTypeName() != "Mesh":
-            continue
-        mesh = UsdGeom.Mesh(prim)
-        face_counts = mesh.GetFaceVertexCountsAttr().Get()
-        if not face_counts:
-            continue
-        # Quick-and-dirty planar UVs: each face gets [(0,0), (r,0), (r,r), (0,r)]
-        # tiled by ``repeat``. Works for top-down look on a box; sides will
-        # repeat but won't read as wrong since they're nearly hidden.
-        r_u, r_v = repeat
-        uvs = []
-        for n in face_counts:
-            if n == 4:
-                uvs.extend(
-                    [(0.0, 0.0), (r_u, 0.0), (r_u, r_v), (0.0, r_v)]
-                )
-            else:
-                # Triangle or n-gon: distribute evenly around a unit triangle.
-                uvs.extend([(0.0, 0.0), (r_u, 0.0), (0.0, r_v)] * (n // 3 + 1))
-                uvs = uvs[: sum(face_counts)]
-        primvars_api = UsdGeom.PrimvarsAPI(prim)
-        st = primvars_api.CreatePrimvar(
-            "st", Sdf.ValueTypeNames.TexCoord2fArray,
-            UsdGeom.Tokens.faceVarying,
-        )
-        st.Set([Gf.Vec2f(u, v) for (u, v) in uvs])
+    w, h = size
+    mesh = UsdGeom.Mesh.Define(stage, prim_path)
+    mesh.CreatePointsAttr([
+        Gf.Vec3f(-w / 2, -h / 2, z),
+        Gf.Vec3f( w / 2, -h / 2, z),
+        Gf.Vec3f( w / 2,  h / 2, z),
+        Gf.Vec3f(-w / 2,  h / 2, z),
+    ])
+    mesh.CreateFaceVertexCountsAttr([4])
+    mesh.CreateFaceVertexIndicesAttr([0, 1, 2, 3])
+    mesh.CreateNormalsAttr([Gf.Vec3f(0, 0, 1)] * 4)
+    mesh.SetNormalsInterpolation(UsdGeom.Tokens.faceVarying)
+    mesh.CreateSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
+
+    primvars_api = UsdGeom.PrimvarsAPI(mesh.GetPrim())
+    st = primvars_api.CreatePrimvar(
+        "st", Sdf.ValueTypeNames.TexCoord2fArray,
+        UsdGeom.Tokens.faceVarying,
+    )
+    u, v = st_repeat
+    st.Set([Gf.Vec2f(0, 0), Gf.Vec2f(u, 0), Gf.Vec2f(u, v), Gf.Vec2f(0, v)])
+    return mesh
 
 
-_ACCENT_LINK_HINTS: tuple[str, ...] = (
-    "joint", "cap", "cover", "collar", "flange",
-)
+def _build_textured_box_with_top_uv(
+    stage,
+    prim_path: str,
+    size: tuple[float, float, float],
+    top_z: float,
+    st_repeat: tuple[float, float],
+) -> UsdGeom.Mesh:
+    """Box centred in XY, top face at ``top_z`` with UVs; sides flat-UV.
+
+    Six quad faces (24 face-vertex indices). Only the top face carries
+    the tiled ST; the other five use ``[0,1]²`` (still valid UVs, but the
+    texture will look uniform on the sides — which is fine because the
+    camera looks down at the desk).
+    """
+    w, h, t = size
+    z_top = top_z
+    z_bot = top_z - t
+    pts = [
+        Gf.Vec3f(-w / 2, -h / 2, z_bot),
+        Gf.Vec3f( w / 2, -h / 2, z_bot),
+        Gf.Vec3f( w / 2,  h / 2, z_bot),
+        Gf.Vec3f(-w / 2,  h / 2, z_bot),
+        Gf.Vec3f(-w / 2, -h / 2, z_top),
+        Gf.Vec3f( w / 2, -h / 2, z_top),
+        Gf.Vec3f( w / 2,  h / 2, z_top),
+        Gf.Vec3f(-w / 2,  h / 2, z_top),
+    ]
+    indices = [
+        3, 2, 1, 0,   # bottom (CW from above, so visible from below)
+        4, 5, 6, 7,   # top    (CCW from above)
+        0, 1, 5, 4,   # -Y side
+        1, 2, 6, 5,   # +X side
+        2, 3, 7, 6,   # +Y side
+        3, 0, 4, 7,   # -X side
+    ]
+    counts = [4] * 6
+    u, v = st_repeat
+    side_uv = [(0, 0), (1, 0), (1, 1), (0, 1)]
+    uvs = (
+        side_uv +                                                # bottom
+        [(0, 0), (u, 0), (u, v), (0, v)] +                       # TOP — tiled
+        side_uv + side_uv + side_uv + side_uv                    # 4 sides
+    )
+
+    mesh = UsdGeom.Mesh.Define(stage, prim_path)
+    mesh.CreatePointsAttr(pts)
+    mesh.CreateFaceVertexCountsAttr(counts)
+    mesh.CreateFaceVertexIndicesAttr(indices)
+    mesh.CreateSubdivisionSchemeAttr().Set(UsdGeom.Tokens.none)
+
+    primvars_api = UsdGeom.PrimvarsAPI(mesh.GetPrim())
+    st = primvars_api.CreatePrimvar(
+        "st", Sdf.ValueTypeNames.TexCoord2fArray,
+        UsdGeom.Tokens.faceVarying,
+    )
+    st.Set([Gf.Vec2f(uu, vv) for (uu, vv) in uvs])
+    return mesh
+
+
+def _dump_robot_subtree(stage, robot_prim_path: str) -> None:
+    """One-time histogram of prim types under the robot — diagnostic only."""
+    root = stage.GetPrimAtPath(robot_prim_path)
+    histogram: dict[str, int] = {}
+    instanced = 0
+    instance_proxies = 0
+    predicate = Usd.TraverseInstanceProxies(Usd.PrimAllPrimsPredicate)
+    for prim in Usd.PrimRange(root, predicate):
+        t = prim.GetTypeName() or "<no-type>"
+        histogram[t] = histogram.get(t, 0) + 1
+        if prim.IsInstance():
+            instanced += 1
+        if prim.IsInstanceProxy():
+            instance_proxies += 1
+    parts = ", ".join(f"{t}: {n}" for t, n in sorted(histogram.items()))
+    print(
+        f"[task1b] UR5 subtree — {parts}; instances={instanced}, "
+        f"instance_proxies={instance_proxies}"
+    )
 
 
 def _apply_robot_livery(stage, robot_prim_path: str) -> None:
-    """Per-link UsdPreviewSurface mimicking the real UR5 livery.
+    """Bind a brushed-aluminum material to the robot root prim.
 
-    The UR5 is brushed aluminum with darker grey joint hubs. We bind two
-    materials, picking by the nearest ancestor link name:
-
-    * silver   — `(0.80, 0.80, 0.82)`, metallic=0.55, roughness=0.35
-    * charcoal — `(0.18, 0.18, 0.20)`, metallic=0.55, roughness=0.45
+    Binding at the root with ``strongerThanDescendants`` overrides every
+    descendant MDL binding regardless of whether the descendants are
+    Mesh, Subset, or instance proxies. This is the brute-force fix for
+    the previous per-mesh walk that found zero Meshes — the UR5 USD's
+    hierarchy doesn't surface plain Mesh prims to the default predicate.
     """
     silver = _make_preview_material(
         stage, "/World/Materials/UR5Silver",
         diffuse=(0.80, 0.80, 0.82), roughness=0.35, metallic=0.55,
     )
-    charcoal = _make_preview_material(
-        stage, "/World/Materials/UR5Charcoal",
-        diffuse=(0.18, 0.18, 0.20), roughness=0.45, metallic=0.55,
-    )
     root = stage.GetPrimAtPath(robot_prim_path)
-    silver_count = 0
-    charcoal_count = 0
-    for prim in Usd.PrimRange(root):
-        if prim.GetTypeName() != "Mesh":
-            continue
-        # Walk up to find which link this mesh belongs to.
-        path_str = str(prim.GetPath()).lower()
-        accent = any(hint in path_str for hint in _ACCENT_LINK_HINTS)
-        material = charcoal if accent else silver
-        binding_api = UsdShade.MaterialBindingAPI.Apply(prim)
-        binding_api.Bind(
-            material,
-            bindingStrength=UsdShade.Tokens.strongerThanDescendants,
-        )
-        if accent:
-            charcoal_count += 1
-        else:
-            silver_count += 1
-    print(
-        f"[task1b] UR5 livery — silver: {silver_count} meshes, "
-        f"charcoal: {charcoal_count} meshes"
+    binding_api = UsdShade.MaterialBindingAPI.Apply(root)
+    binding_api.Bind(
+        silver,
+        bindingStrength=UsdShade.Tokens.strongerThanDescendants,
     )
+    print("[task1b] UR5 livery — bound silver material at /World/UR5 root")
 
 
 def _build_floor(world, stage, renderer: str) -> None:
-    """Large flat slab at z=0 with a concrete-grey preview material."""
-    world.scene.add(
-        FixedCuboid(
-            prim_path=FLOOR_PRIM_PATH,
-            name="floor",
-            position=np.array([0.0, 0.0, -FLOOR_THICKNESS / 2.0]),
-            scale=np.array([FLOOR_SIZE, FLOOR_SIZE, FLOOR_THICKNESS]),
-            color=np.array([0.62, 0.62, 0.64]),
-        )
+    """Flat ``UsdGeom.Mesh`` quad at z=0 with tile texture (Storm)."""
+    floor_mesh = _build_textured_quad(
+        stage, FLOOR_PRIM_PATH,
+        size=(FLOOR_SIZE, FLOOR_SIZE), z=0.0, st_repeat=(8.0, 8.0),
     )
     if renderer == "pxr":
         if Path(TILE_TEXTURE_PATH).exists():
             mat = _make_textured_material(
                 stage, "/World/Materials/Floor",
                 tex_path=TILE_TEXTURE_PATH,
-                st_scale=(1.0, 1.0),       # texture already pre-tiled
+                st_scale=(1.0, 1.0),
                 roughness=0.55, metallic=0.05,
             )
-            _add_planar_st_primvar(
-                stage, FLOOR_PRIM_PATH, repeat=(8.0, 8.0)
+            UsdShade.MaterialBindingAPI.Apply(floor_mesh.GetPrim()).Bind(
+                mat, bindingStrength=UsdShade.Tokens.strongerThanDescendants,
             )
-            _bind_material_recursive(stage, FLOOR_PRIM_PATH, mat)
             print("[task1b] Floor: tile texture applied (8x8 repeats)")
         else:
             mat = _make_preview_material(
                 stage, "/World/Materials/Floor",
                 diffuse=(0.62, 0.62, 0.64), roughness=0.85, metallic=0.0,
             )
-            _bind_material_recursive(stage, FLOOR_PRIM_PATH, mat)
-            print(f"[task1b] Floor: tile texture missing; using flat grey")
+            UsdShade.MaterialBindingAPI.Apply(floor_mesh.GetPrim()).Bind(
+                mat, bindingStrength=UsdShade.Tokens.strongerThanDescendants,
+            )
+            print("[task1b] Floor: tile texture missing; using flat grey")
 
 
 def _build_desk(world, stage, renderer: str) -> None:
-    """Thin top slab + four square legs, all matte wood."""
-    top_z = TABLE_HEIGHT - DESK_TOP_THICKNESS / 2.0
-    world.scene.add(
-        FixedCuboid(
-            prim_path=DESK_TOP_PATH,
-            name="desk_top",
-            position=np.array([0.0, 0.0, top_z]),
-            scale=np.array([TABLE_WIDTH, TABLE_DEPTH, DESK_TOP_THICKNESS]),
-            color=np.array([0.55, 0.35, 0.18]),
-        )
+    """``UsdGeom.Mesh`` box top with wood texture + four FixedCuboid legs."""
+    top_mesh = _build_textured_box_with_top_uv(
+        stage, DESK_TOP_PATH,
+        size=(TABLE_WIDTH, TABLE_DEPTH, DESK_TOP_THICKNESS),
+        top_z=TABLE_HEIGHT,
+        st_repeat=(2.0, 1.5),
     )
 
-    # Four legs at the corners, inset slightly from the top edges.
     leg_h = TABLE_HEIGHT - DESK_TOP_THICKNESS
     leg_z = leg_h / 2.0
     half_x = TABLE_WIDTH / 2.0 - DESK_LEG_INSET - DESK_LEG_THICKNESS / 2.0
@@ -530,7 +569,6 @@ def _build_desk(world, stage, renderer: str) -> None:
         )
 
     if renderer == "pxr":
-        # Top: textured wood. Legs: flat brown (texture won't read at 7 cm).
         if Path(WOOD_TEXTURE_PATH).exists():
             top_mat = _make_textured_material(
                 stage, "/World/Materials/DeskWoodTex",
@@ -538,18 +576,16 @@ def _build_desk(world, stage, renderer: str) -> None:
                 st_scale=(1.0, 1.0),
                 roughness=0.45, metallic=0.0,
             )
-            _add_planar_st_primvar(
-                stage, DESK_TOP_PATH, repeat=(2.0, 1.5)
-            )
-            _bind_material_recursive(stage, DESK_TOP_PATH, top_mat)
             print("[task1b] Desk top: wood texture applied")
         else:
             top_mat = _make_preview_material(
                 stage, "/World/Materials/DeskWood",
                 diffuse=(0.55, 0.35, 0.18), roughness=0.55, metallic=0.0,
             )
-            _bind_material_recursive(stage, DESK_TOP_PATH, top_mat)
             print("[task1b] Desk top: wood texture missing; using flat brown")
+        UsdShade.MaterialBindingAPI.Apply(top_mesh.GetPrim()).Bind(
+            top_mat, bindingStrength=UsdShade.Tokens.strongerThanDescendants,
+        )
 
         legs_mat = _make_preview_material(
             stage, "/World/Materials/DeskLegs",
@@ -742,6 +778,9 @@ def main() -> None:
 
     # ── Lighting — key/fill/bounce (no DomeLight: Storm spams without HDR) ─
     _add_studio_lighting(stage)
+
+    # One-time diagnostic so we know what's actually under /World/UR5.
+    _dump_robot_subtree(stage, ROBOT_PRIM_PATH)
 
     # ── Force Storm-compatible material on the robot meshes ───────────────
     # The UR5 USD has only MDL bindings, which Storm cannot evaluate.
