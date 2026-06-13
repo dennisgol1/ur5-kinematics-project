@@ -164,18 +164,39 @@ from task1_fk_validation import (
 # UR5_USD_LOCAL_PATH = "/home/user/assets/ur5.usd"
 UR5_USD_LOCAL_PATH: str | None = None
 
-# Table geometry — top surface ends up exactly at TABLE_HEIGHT
+# Desk geometry — top surface ends up exactly at TABLE_HEIGHT
 TABLE_WIDTH:   float = 1.50   # m  (X)
 TABLE_DEPTH:   float = 1.20   # m  (Y)
 TABLE_HEIGHT:  float = 0.75   # m  (Z, from floor to top surface)
+DESK_TOP_THICKNESS: float = 0.05   # m
+DESK_LEG_THICKNESS: float = 0.07   # m  (square cross-section)
+DESK_LEG_INSET:     float = 0.05   # m  (inset from desk edges)
 
-# The UR5 base is placed on the table surface
+# Floor slab
+FLOOR_SIZE:      float = 8.0    # m  (X = Y)
+FLOOR_THICKNESS: float = 0.02   # m
+
+# The UR5 base is placed on the desk surface
 ROBOT_BASE_Z: float = TABLE_HEIGHT
 
 # Prim paths
-TABLE_PRIM_PATH  = "/World/Workbench"
+FLOOR_PRIM_PATH  = "/World/Floor"
+DESK_TOP_PATH    = "/World/Desk/Top"
+DESK_LEGS_PATH   = "/World/Desk/Legs"
 ROBOT_PRIM_PATH  = "/World/UR5"
 ROBOT_NAME       = "ur5"
+
+# Local textures (ship with Isaac Sim 5.1.0 — no Nucleus dependency)
+WOOD_TEXTURE_PATH = (
+    "/home/ubuntu/Simulators/isaacsim/extscache/"
+    "omni.kit.usdz_export-1.0.9+69cbf6ad/data/test_stage/textures/"
+    "mahogany_floorboards.png"
+)
+TILE_TEXTURE_PATH = (
+    "/home/ubuntu/Simulators/isaacsim/extscache/"
+    "omni.kit.asset_converter-5.0.17+107.3.1.lx64.r.cp311.u353/"
+    "data/materials/C/F/tile.1001.png"
+)
 
 # EE prim candidates (tried in order; first valid one wins)
 EE_CANDIDATE_PRIMS = [
@@ -229,60 +250,70 @@ def _add_studio_lighting(stage) -> None:
     contribution is uniform white anyway — which made the robot blend into
     the white background.
     """
-    # Key light: warm directional from the front-upper-right.
+    # Key light: warm directional from the front-upper-right. Wider angle =
+    # softer shadows = less facet contrast on the UR5.
     key = UsdLux.DistantLight.Define(stage, Sdf.Path("/World/Lights/Key"))
-    key.CreateIntensityAttr(3500.0)
+    key.CreateIntensityAttr(2000.0)
     key.CreateColorAttr(Gf.Vec3f(1.00, 0.96, 0.88))
-    key.CreateAngleAttr(2.0)
+    key.CreateAngleAttr(8.0)
     xf = UsdGeom.Xformable(key.GetPrim())
     xf.ClearXformOpOrder()
     xf.AddRotateXYZOp().Set(Gf.Vec3f(-55.0, 0.0, 35.0))
 
-    # Fill light: cooler directional from the opposite side at ~1/3 intensity.
+    # Fill light: cooler directional from the opposite side.
     fill = UsdLux.DistantLight.Define(stage, Sdf.Path("/World/Lights/Fill"))
-    fill.CreateIntensityAttr(1200.0)
+    fill.CreateIntensityAttr(600.0)
     fill.CreateColorAttr(Gf.Vec3f(0.85, 0.90, 1.00))
-    fill.CreateAngleAttr(4.0)
+    fill.CreateAngleAttr(10.0)
     xf = UsdGeom.Xformable(fill.GetPrim())
     xf.ClearXformOpOrder()
     xf.AddRotateXYZOp().Set(Gf.Vec3f(-30.0, 0.0, -150.0))
 
-    # Sphere bounce light overhead.
+    # Overhead softbox — provides the bulk of the ambient term.
     sph = UsdLux.SphereLight.Define(stage, Sdf.Path("/World/Lights/Bounce"))
-    sph.CreateIntensityAttr(15000.0)
+    sph.CreateIntensityAttr(6000.0)
     sph.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
-    sph.CreateRadiusAttr(0.6)
+    sph.CreateRadiusAttr(1.0)
     xf = UsdGeom.Xformable(sph.GetPrim())
     xf.ClearXformOpOrder()
     xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 3.0))
     print("[task1b] Added key + fill + bounce lights")
 
 
-def _apply_preview_material(stage, robot_prim_path: str) -> None:
-    """Bind a ``UsdPreviewSurface`` to every Mesh under the robot.
+def _make_preview_material(
+    stage,
+    mat_path: str,
+    diffuse: tuple[float, float, float],
+    roughness: float = 0.6,
+    metallic: float = 0.0,
+) -> UsdShade.Material:
+    """Author a ``UsdPreviewSurface`` Storm can shade without an IBL.
 
-    The UR5 USD ships with MDL material bindings. RTX (Hydra-MDL) renders
-    those natively; Storm (pxr) cannot evaluate MDL and falls back to a
-    100% emissive white surface — invisible against the white sky. This
-    helper overrides the bindings with a Storm-compatible preview shader
-    so the geometry actually picks up the scene lights.
+    ``metallic=0`` is deliberate: with only directional lights Storm has no
+    environment to sample for the metallic specular and produces tiny
+    facet-sized highlights that read as noise on faceted geometry.
     """
-    mat_path = "/World/RobotMat"
     material = UsdShade.Material.Define(stage, mat_path)
     shader = UsdShade.Shader.Define(stage, mat_path + "/Shader")
     shader.CreateIdAttr("UsdPreviewSurface")
     shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-        Gf.Vec3f(0.55, 0.57, 0.62)
+        Gf.Vec3f(*diffuse)
     )
-    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.35)
-    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.25)
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(roughness)
+    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(metallic)
     material.CreateSurfaceOutput().ConnectToSource(
         shader.ConnectableAPI(), "surface",
     )
+    return material
 
-    robot_prim = stage.GetPrimAtPath(robot_prim_path)
+
+def _bind_material_recursive(
+    stage, root_path: str, material: UsdShade.Material,
+) -> int:
+    """Bind ``material`` to every Mesh under ``root_path``. Returns count."""
+    root = stage.GetPrimAtPath(root_path)
     count = 0
-    for prim in Usd.PrimRange(robot_prim):
+    for prim in Usd.PrimRange(root):
         if prim.GetTypeName() == "Mesh":
             binding_api = UsdShade.MaterialBindingAPI.Apply(prim)
             binding_api.Bind(
@@ -290,7 +321,241 @@ def _apply_preview_material(stage, robot_prim_path: str) -> None:
                 bindingStrength=UsdShade.Tokens.strongerThanDescendants,
             )
             count += 1
-    print(f"[task1b] Bound preview material to {count} robot meshes")
+    return count
+
+
+def _make_textured_material(
+    stage,
+    mat_path: str,
+    tex_path: str,
+    st_scale: tuple[float, float] = (1.0, 1.0),
+    roughness: float = 0.6,
+    metallic: float = 0.0,
+) -> UsdShade.Material:
+    """``UsdPreviewSurface`` whose ``diffuseColor`` is a tiled texture.
+
+    Builds the standard Storm-compatible shader graph:
+        UsdPrimvarReader_float2 ('st')
+            → (scale)
+            → UsdUVTexture (file=tex_path)
+            → UsdPreviewSurface.diffuseColor
+    """
+    material = UsdShade.Material.Define(stage, mat_path)
+
+    primvar = UsdShade.Shader.Define(stage, mat_path + "/PrimvarReader")
+    primvar.CreateIdAttr("UsdPrimvarReader_float2")
+    primvar.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+    primvar_out = primvar.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+
+    tex = UsdShade.Shader.Define(stage, mat_path + "/Texture")
+    tex.CreateIdAttr("UsdUVTexture")
+    tex.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(tex_path)
+    tex.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
+    tex.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")
+    tex.CreateInput("scale", Sdf.ValueTypeNames.Float4).Set(
+        Gf.Vec4f(st_scale[0], st_scale[1], 1.0, 1.0)
+    )
+    tex.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(primvar_out)
+    tex_rgb = tex.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+
+    shader = UsdShade.Shader.Define(stage, mat_path + "/Shader")
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f) \
+          .ConnectToSource(tex_rgb)
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(roughness)
+    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(metallic)
+    material.CreateSurfaceOutput().ConnectToSource(
+        shader.ConnectableAPI(), "surface",
+    )
+    return material
+
+
+def _add_planar_st_primvar(
+    stage,
+    cube_root_path: str,
+    repeat: tuple[float, float] = (1.0, 1.0),
+) -> None:
+    """Author an ``st`` primvar on every Mesh under ``cube_root_path``.
+
+    ``isaacsim.core.api.objects.FixedCuboid`` wraps ``UsdGeom.Cube`` (and
+    its tessellated Mesh proxy). The Mesh does not author ``st`` by
+    default, so Storm's ``UsdUVTexture`` cannot sample our texture.
+
+    This walks the prim tree, finds every Mesh, looks at its face counts
+    and authors a per-face-vertex constant tiling using the mesh's XY
+    bounds. ``repeat`` is how many times the texture tiles across the
+    object's footprint.
+    """
+    root = stage.GetPrimAtPath(cube_root_path)
+    for prim in Usd.PrimRange(root):
+        if prim.GetTypeName() != "Mesh":
+            continue
+        mesh = UsdGeom.Mesh(prim)
+        face_counts = mesh.GetFaceVertexCountsAttr().Get()
+        if not face_counts:
+            continue
+        # Quick-and-dirty planar UVs: each face gets [(0,0), (r,0), (r,r), (0,r)]
+        # tiled by ``repeat``. Works for top-down look on a box; sides will
+        # repeat but won't read as wrong since they're nearly hidden.
+        r_u, r_v = repeat
+        uvs = []
+        for n in face_counts:
+            if n == 4:
+                uvs.extend(
+                    [(0.0, 0.0), (r_u, 0.0), (r_u, r_v), (0.0, r_v)]
+                )
+            else:
+                # Triangle or n-gon: distribute evenly around a unit triangle.
+                uvs.extend([(0.0, 0.0), (r_u, 0.0), (0.0, r_v)] * (n // 3 + 1))
+                uvs = uvs[: sum(face_counts)]
+        primvars_api = UsdGeom.PrimvarsAPI(prim)
+        st = primvars_api.CreatePrimvar(
+            "st", Sdf.ValueTypeNames.TexCoord2fArray,
+            UsdGeom.Tokens.faceVarying,
+        )
+        st.Set([Gf.Vec2f(u, v) for (u, v) in uvs])
+
+
+_ACCENT_LINK_HINTS: tuple[str, ...] = (
+    "joint", "cap", "cover", "collar", "flange",
+)
+
+
+def _apply_robot_livery(stage, robot_prim_path: str) -> None:
+    """Per-link UsdPreviewSurface mimicking the real UR5 livery.
+
+    The UR5 is brushed aluminum with darker grey joint hubs. We bind two
+    materials, picking by the nearest ancestor link name:
+
+    * silver   — `(0.80, 0.80, 0.82)`, metallic=0.55, roughness=0.35
+    * charcoal — `(0.18, 0.18, 0.20)`, metallic=0.55, roughness=0.45
+    """
+    silver = _make_preview_material(
+        stage, "/World/Materials/UR5Silver",
+        diffuse=(0.80, 0.80, 0.82), roughness=0.35, metallic=0.55,
+    )
+    charcoal = _make_preview_material(
+        stage, "/World/Materials/UR5Charcoal",
+        diffuse=(0.18, 0.18, 0.20), roughness=0.45, metallic=0.55,
+    )
+    root = stage.GetPrimAtPath(robot_prim_path)
+    silver_count = 0
+    charcoal_count = 0
+    for prim in Usd.PrimRange(root):
+        if prim.GetTypeName() != "Mesh":
+            continue
+        # Walk up to find which link this mesh belongs to.
+        path_str = str(prim.GetPath()).lower()
+        accent = any(hint in path_str for hint in _ACCENT_LINK_HINTS)
+        material = charcoal if accent else silver
+        binding_api = UsdShade.MaterialBindingAPI.Apply(prim)
+        binding_api.Bind(
+            material,
+            bindingStrength=UsdShade.Tokens.strongerThanDescendants,
+        )
+        if accent:
+            charcoal_count += 1
+        else:
+            silver_count += 1
+    print(
+        f"[task1b] UR5 livery — silver: {silver_count} meshes, "
+        f"charcoal: {charcoal_count} meshes"
+    )
+
+
+def _build_floor(world, stage, renderer: str) -> None:
+    """Large flat slab at z=0 with a concrete-grey preview material."""
+    world.scene.add(
+        FixedCuboid(
+            prim_path=FLOOR_PRIM_PATH,
+            name="floor",
+            position=np.array([0.0, 0.0, -FLOOR_THICKNESS / 2.0]),
+            scale=np.array([FLOOR_SIZE, FLOOR_SIZE, FLOOR_THICKNESS]),
+            color=np.array([0.62, 0.62, 0.64]),
+        )
+    )
+    if renderer == "pxr":
+        if Path(TILE_TEXTURE_PATH).exists():
+            mat = _make_textured_material(
+                stage, "/World/Materials/Floor",
+                tex_path=TILE_TEXTURE_PATH,
+                st_scale=(1.0, 1.0),       # texture already pre-tiled
+                roughness=0.55, metallic=0.05,
+            )
+            _add_planar_st_primvar(
+                stage, FLOOR_PRIM_PATH, repeat=(8.0, 8.0)
+            )
+            _bind_material_recursive(stage, FLOOR_PRIM_PATH, mat)
+            print("[task1b] Floor: tile texture applied (8x8 repeats)")
+        else:
+            mat = _make_preview_material(
+                stage, "/World/Materials/Floor",
+                diffuse=(0.62, 0.62, 0.64), roughness=0.85, metallic=0.0,
+            )
+            _bind_material_recursive(stage, FLOOR_PRIM_PATH, mat)
+            print(f"[task1b] Floor: tile texture missing; using flat grey")
+
+
+def _build_desk(world, stage, renderer: str) -> None:
+    """Thin top slab + four square legs, all matte wood."""
+    top_z = TABLE_HEIGHT - DESK_TOP_THICKNESS / 2.0
+    world.scene.add(
+        FixedCuboid(
+            prim_path=DESK_TOP_PATH,
+            name="desk_top",
+            position=np.array([0.0, 0.0, top_z]),
+            scale=np.array([TABLE_WIDTH, TABLE_DEPTH, DESK_TOP_THICKNESS]),
+            color=np.array([0.55, 0.35, 0.18]),
+        )
+    )
+
+    # Four legs at the corners, inset slightly from the top edges.
+    leg_h = TABLE_HEIGHT - DESK_TOP_THICKNESS
+    leg_z = leg_h / 2.0
+    half_x = TABLE_WIDTH / 2.0 - DESK_LEG_INSET - DESK_LEG_THICKNESS / 2.0
+    half_y = TABLE_DEPTH / 2.0 - DESK_LEG_INSET - DESK_LEG_THICKNESS / 2.0
+    for i, (sx, sy) in enumerate(
+        [(+1, +1), (+1, -1), (-1, +1), (-1, -1)]
+    ):
+        world.scene.add(
+            FixedCuboid(
+                prim_path=f"{DESK_LEGS_PATH}/Leg{i}",
+                name=f"desk_leg_{i}",
+                position=np.array([sx * half_x, sy * half_y, leg_z]),
+                scale=np.array(
+                    [DESK_LEG_THICKNESS, DESK_LEG_THICKNESS, leg_h]
+                ),
+                color=np.array([0.45, 0.28, 0.13]),
+            )
+        )
+
+    if renderer == "pxr":
+        # Top: textured wood. Legs: flat brown (texture won't read at 7 cm).
+        if Path(WOOD_TEXTURE_PATH).exists():
+            top_mat = _make_textured_material(
+                stage, "/World/Materials/DeskWoodTex",
+                tex_path=WOOD_TEXTURE_PATH,
+                st_scale=(1.0, 1.0),
+                roughness=0.45, metallic=0.0,
+            )
+            _add_planar_st_primvar(
+                stage, DESK_TOP_PATH, repeat=(2.0, 1.5)
+            )
+            _bind_material_recursive(stage, DESK_TOP_PATH, top_mat)
+            print("[task1b] Desk top: wood texture applied")
+        else:
+            top_mat = _make_preview_material(
+                stage, "/World/Materials/DeskWood",
+                diffuse=(0.55, 0.35, 0.18), roughness=0.55, metallic=0.0,
+            )
+            _bind_material_recursive(stage, DESK_TOP_PATH, top_mat)
+            print("[task1b] Desk top: wood texture missing; using flat brown")
+
+        legs_mat = _make_preview_material(
+            stage, "/World/Materials/DeskLegs",
+            diffuse=(0.42, 0.26, 0.13), roughness=0.6, metallic=0.0,
+        )
+        _bind_material_recursive(stage, DESK_LEGS_PATH, legs_mat)
 
 
 def _smooth_blend(q_start: np.ndarray, q_end: np.ndarray, alpha: float) -> np.ndarray:
@@ -452,19 +717,10 @@ def main() -> None:
     # ── World (60 Hz physics) ─────────────────────────────────────────────
     world = World(stage_units_in_meters=1.0, physics_dt=1.0 / 60.0)
 
-    # ── Ground plane ──────────────────────────────────────────────────────
-    world.scene.add_default_ground_plane()
-
-    # ── Workbench (static rigid body) ────────────────────────────────────
-    world.scene.add(
-        FixedCuboid(
-            prim_path=TABLE_PRIM_PATH,
-            name="workbench",
-            position=np.array([0.0, 0.0, TABLE_HEIGHT / 2.0]),
-            scale=np.array([TABLE_WIDTH, TABLE_DEPTH, TABLE_HEIGHT]),
-            color=np.array([0.55, 0.35, 0.15]),   # warm wood brown
-        )
-    )
+    # ── Stage (built before world.reset() so xforms author cleanly) ───────
+    stage = omni.usd.get_context().get_stage()
+    _build_floor(world, stage, cli.renderer)
+    _build_desk(world, stage, cli.renderer)
 
     # ── UR5 robot — base on the table surface ────────────────────────────
     # Capture the prim so we can pick the visual-quality variant and place
@@ -484,15 +740,13 @@ def main() -> None:
 
     world.reset()
 
-    stage = omni.usd.get_context().get_stage()
-
     # ── Lighting — key/fill/bounce (no DomeLight: Storm spams without HDR) ─
     _add_studio_lighting(stage)
 
     # ── Force Storm-compatible material on the robot meshes ───────────────
     # The UR5 USD has only MDL bindings, which Storm cannot evaluate.
     if cli.renderer == "pxr":
-        _apply_preview_material(stage, ROBOT_PRIM_PATH)
+        _apply_robot_livery(stage, ROBOT_PRIM_PATH)
 
     # Confirm where the robot actually ended up after world.reset().
     base_world_pos, _ = robot.get_world_pose()
