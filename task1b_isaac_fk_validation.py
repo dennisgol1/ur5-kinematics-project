@@ -48,6 +48,21 @@ _parser.add_argument(
     "--dwell", type=float, default=3.0,
     help="Seconds to hold each configuration in the viewport (default 3.0)",
 )
+_parser.add_argument(
+    "--renderer", choices=("rtx", "pxr"), default="pxr",
+    help="Hydra renderer: 'pxr' (Pixar Storm, default — this machine's "
+         "RTX scenedb plugin crashes at startup because the GPU is on a "
+         "PCIe Gen4 x1 link, 1/16 the expected bandwidth) or 'rtx'",
+)
+_parser.add_argument(
+    "--motion", choices=("smooth", "snap"), default="smooth",
+    help="How to move between FK configs: 'smooth' (cosine-eased "
+         "interpolation, default) or 'snap' (instantaneous)",
+)
+_parser.add_argument(
+    "--motion-time", type=float, default=2.0,
+    help="Seconds to travel between configs in smooth mode (default 2.0)",
+)
 cli, _unknown = _parser.parse_known_args()
 
 # ---------------------------------------------------------------------------
@@ -58,16 +73,23 @@ try:
 except ImportError:
     from omni.isaac.kit import SimulationApp     # Isaac Sim 4.x fallback
 
-simulation_app = SimulationApp(
-    {
-        "headless": False,
-        "width": 1920,
-        "height": 1080,
-        # Do not set "renderer" here — Isaac Sim 5.x selects the correct
-        # RTX backend from its own .kit app config.  Forcing
-        # "RaytracedLighting" causes librtx.scenedb to crash on startup.
-    }
-)
+_app_cfg: dict = {
+    "headless": False,
+    "width": 1920,
+    "height": 1080,
+}
+if cli.renderer == "pxr":
+    # Fallback for machines where librtx.scenedb.plugin.so crashes at
+    # carbOnPluginStartup. Surfaces render flat-grey (Storm cannot evaluate
+    # MDL), but geometry and physics still work.
+    _app_cfg["extra_args"] = [
+        "--/app/extensions/excluded/0=omni.hydra.rtx",
+        "--/app/extensions/excluded/1=rtx.scenedb",
+        "--enable", "omni.hydra.pxr",
+        "--/renderer/enabled=pxr",
+        "--/renderer/active=pxr",
+    ]
+simulation_app = SimulationApp(_app_cfg)
 
 # ---------------------------------------------------------------------------
 # All remaining imports — AFTER SimulationApp()
@@ -78,22 +100,53 @@ from pathlib import Path
 import numpy as np
 
 import omni.usd
-from omni.isaac.core import World
-from omni.isaac.core.objects import FixedCuboid
-from omni.isaac.core.prims import XFormPrim
-from omni.isaac.core.robots import Robot
-from omni.isaac.core.utils.rotations import quat_to_euler_angles
+from pxr import Gf, Sdf, Usd, UsdGeom, UsdLux, UsdShade
 
+# Prefer the new isaacsim.* surface (Isaac Sim 5.x); fall back to omni.isaac.*.
 try:
-    from omni.isaac.nucleus import get_assets_root_path          # 5.x
+    from isaacsim.core.api import World
+    from isaacsim.core.api.objects import FixedCuboid
+    from isaacsim.core.api.robots import Robot
 except ImportError:
-    from omni.isaac.core.utils.nucleus import get_assets_root_path  # 4.x
+    from omni.isaac.core import World                       # type: ignore
+    from omni.isaac.core.objects import FixedCuboid         # type: ignore
+    from omni.isaac.core.robots import Robot                # type: ignore
 
 try:
-    from omni.isaac.core.utils.viewports import set_camera_view
+    from isaacsim.core.prims import SingleXFormPrim as XFormPrim
+except ImportError:
+    try:
+        from isaacsim.core.prims import XFormPrim           # type: ignore
+    except ImportError:
+        from omni.isaac.core.prims import XFormPrim         # type: ignore
+
+try:
+    from isaacsim.core.utils.rotations import quat_to_euler_angles
+except ImportError:
+    from omni.isaac.core.utils.rotations import quat_to_euler_angles  # type: ignore
+
+try:
+    from isaacsim.core.utils.stage import add_reference_to_stage
+except ImportError:
+    from omni.isaac.core.utils.stage import add_reference_to_stage  # type: ignore
+
+try:
+    from isaacsim.storage.native import get_assets_root_path
+except ImportError:
+    try:
+        from omni.isaac.nucleus import get_assets_root_path        # type: ignore
+    except ImportError:
+        from omni.isaac.core.utils.nucleus import get_assets_root_path  # type: ignore
+
+try:
+    from isaacsim.core.utils.viewports import set_camera_view
     _HAS_VIEWPORT_HELPER = True
 except ImportError:
-    _HAS_VIEWPORT_HELPER = False
+    try:
+        from omni.isaac.core.utils.viewports import set_camera_view  # type: ignore
+        _HAS_VIEWPORT_HELPER = True
+    except ImportError:
+        _HAS_VIEWPORT_HELPER = False
 
 # Re-use FK math + test configs from Task 1
 sys.path.insert(0, str(Path(__file__).parent))
@@ -166,6 +219,116 @@ def _find_ee_prim(stage) -> str:
         + "\n".join(f"  {p}" for p in EE_CANDIDATE_PRIMS)
         + "\nCheck the stage hierarchy in Isaac Sim and update EE_CANDIDATE_PRIMS."
     )
+
+
+def _add_studio_lighting(stage) -> None:
+    """Two distant lights (key + fill) + a sphere fill light.
+
+    Avoids ``UsdLux.DomeLight`` on purpose: without an HDR texture, Storm
+    spams ``Dome light has no texture asset path`` every frame, and the
+    contribution is uniform white anyway — which made the robot blend into
+    the white background.
+    """
+    # Key light: warm directional from the front-upper-right.
+    key = UsdLux.DistantLight.Define(stage, Sdf.Path("/World/Lights/Key"))
+    key.CreateIntensityAttr(3500.0)
+    key.CreateColorAttr(Gf.Vec3f(1.00, 0.96, 0.88))
+    key.CreateAngleAttr(2.0)
+    xf = UsdGeom.Xformable(key.GetPrim())
+    xf.ClearXformOpOrder()
+    xf.AddRotateXYZOp().Set(Gf.Vec3f(-55.0, 0.0, 35.0))
+
+    # Fill light: cooler directional from the opposite side at ~1/3 intensity.
+    fill = UsdLux.DistantLight.Define(stage, Sdf.Path("/World/Lights/Fill"))
+    fill.CreateIntensityAttr(1200.0)
+    fill.CreateColorAttr(Gf.Vec3f(0.85, 0.90, 1.00))
+    fill.CreateAngleAttr(4.0)
+    xf = UsdGeom.Xformable(fill.GetPrim())
+    xf.ClearXformOpOrder()
+    xf.AddRotateXYZOp().Set(Gf.Vec3f(-30.0, 0.0, -150.0))
+
+    # Sphere bounce light overhead.
+    sph = UsdLux.SphereLight.Define(stage, Sdf.Path("/World/Lights/Bounce"))
+    sph.CreateIntensityAttr(15000.0)
+    sph.CreateColorAttr(Gf.Vec3f(1.0, 1.0, 1.0))
+    sph.CreateRadiusAttr(0.6)
+    xf = UsdGeom.Xformable(sph.GetPrim())
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 3.0))
+    print("[task1b] Added key + fill + bounce lights")
+
+
+def _apply_preview_material(stage, robot_prim_path: str) -> None:
+    """Bind a ``UsdPreviewSurface`` to every Mesh under the robot.
+
+    The UR5 USD ships with MDL material bindings. RTX (Hydra-MDL) renders
+    those natively; Storm (pxr) cannot evaluate MDL and falls back to a
+    100% emissive white surface — invisible against the white sky. This
+    helper overrides the bindings with a Storm-compatible preview shader
+    so the geometry actually picks up the scene lights.
+    """
+    mat_path = "/World/RobotMat"
+    material = UsdShade.Material.Define(stage, mat_path)
+    shader = UsdShade.Shader.Define(stage, mat_path + "/Shader")
+    shader.CreateIdAttr("UsdPreviewSurface")
+    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+        Gf.Vec3f(0.55, 0.57, 0.62)
+    )
+    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.35)
+    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.25)
+    material.CreateSurfaceOutput().ConnectToSource(
+        shader.ConnectableAPI(), "surface",
+    )
+
+    robot_prim = stage.GetPrimAtPath(robot_prim_path)
+    count = 0
+    for prim in Usd.PrimRange(robot_prim):
+        if prim.GetTypeName() == "Mesh":
+            binding_api = UsdShade.MaterialBindingAPI.Apply(prim)
+            binding_api.Bind(
+                material,
+                bindingStrength=UsdShade.Tokens.strongerThanDescendants,
+            )
+            count += 1
+    print(f"[task1b] Bound preview material to {count} robot meshes")
+
+
+def _smooth_blend(q_start: np.ndarray, q_end: np.ndarray, alpha: float) -> np.ndarray:
+    """Cosine-eased interpolation between two joint vectors.
+
+    alpha in [0, 1].  At the endpoints the velocity is zero, which makes
+    the motion read as a deliberate move rather than a teleport.
+    """
+    s = 0.5 - 0.5 * math.cos(math.pi * float(np.clip(alpha, 0.0, 1.0)))
+    return (1.0 - s) * q_start + s * q_end
+
+
+_MESH_VARIANT_CANDIDATES: tuple[str, ...] = (
+    "Quality", "Default", "Visual", "High",
+)
+
+
+def _select_mesh_variant(robot_prim) -> None:
+    """Pick the visual-quality mesh variant on the UR5 USD.
+
+    Without an explicit selection the stage falls back to collision proxy
+    hulls, which render as a sparse wireframe.
+    """
+    vsets = robot_prim.GetVariantSets()
+    names = vsets.GetNames()
+    print(f"[task1b] UR5 variant sets: {names}")
+    if "Mesh" not in names:
+        print("[task1b] No 'Mesh' variant set on UR5 USD — skipping")
+        return
+    vset = vsets.GetVariantSet("Mesh")
+    options = vset.GetVariantNames()
+    chosen = next(
+        (v for v in _MESH_VARIANT_CANDIDATES if v in options),
+        options[0] if options else None,
+    )
+    if chosen:
+        vset.SetVariantSelection(chosen)
+        print(f"[task1b] UR5 mesh variant: {chosen}  (options: {options})")
 
 
 def _quat_wxyz_to_rot(q: np.ndarray) -> np.ndarray:
@@ -304,27 +467,51 @@ def main() -> None:
     )
 
     # ── UR5 robot — base on the table surface ────────────────────────────
+    # Capture the prim so we can pick the visual-quality variant and place
+    # the robot via UsdGeom.Xformable (the reference-repo pattern).
+    robot_prim = add_reference_to_stage(
+        usd_path=usd_path, prim_path=ROBOT_PRIM_PATH,
+    )
+    _select_mesh_variant(robot_prim)
+
+    xf = UsdGeom.Xformable(robot_prim)
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, ROBOT_BASE_Z))
+
     robot: Robot = world.scene.add(
-        Robot(
-            prim_path=ROBOT_PRIM_PATH,
-            name=ROBOT_NAME,
-            usd_path=usd_path,
-            position=np.array([0.0, 0.0, ROBOT_BASE_Z]),
-        )
+        Robot(prim_path=ROBOT_PRIM_PATH, name=ROBOT_NAME)
     )
 
     world.reset()
 
-    # ── Camera — angled view showing robot + table ───────────────────────
+    stage = omni.usd.get_context().get_stage()
+
+    # ── Lighting — key/fill/bounce (no DomeLight: Storm spams without HDR) ─
+    _add_studio_lighting(stage)
+
+    # ── Force Storm-compatible material on the robot meshes ───────────────
+    # The UR5 USD has only MDL bindings, which Storm cannot evaluate.
+    if cli.renderer == "pxr":
+        _apply_preview_material(stage, ROBOT_PRIM_PATH)
+
+    # Confirm where the robot actually ended up after world.reset().
+    base_world_pos, _ = robot.get_world_pose()
+    print(f"[task1b] Robot world pose: {tuple(round(float(v), 3) for v in base_world_pos)}")
+
+    # ── Camera — clear angled view from front-right, robot fills frame ────
     if _HAS_VIEWPORT_HELPER:
         set_camera_view(
-            eye=np.array([2.2, 2.2, 2.0]),
-            target=np.array([0.0, 0.0, TABLE_HEIGHT + 0.5]),
+            eye=np.array([2.5, -1.8, 2.2]),
+            target=np.array([0.0, 0.0, TABLE_HEIGHT + 0.4]),
             camera_prim_path="/OmniverseKit_Persp",
         )
 
+    # Step a few frames so Storm re-renders the new materials
+    for _ in range(5):
+        world.step(render=True)
+        simulation_app.update()
+
     # ── Locate EE and base prims ─────────────────────────────────────────
-    stage        = omni.usd.get_context().get_stage()
     ee_prim_path = _find_ee_prim(stage)
     ee_xform     = XFormPrim(ee_prim_path)
 
@@ -339,19 +526,33 @@ def main() -> None:
     # ── Iterate test configurations ───────────────────────────────────────
     results: list[dict] = []
 
+    # Track previous target so smooth motion has a start point. The first
+    # config interpolates from the home pose returned by the articulation.
+    q_prev: np.ndarray = np.asarray(robot.get_joint_positions(), dtype=np.float64)
+
+    motion_steps = max(1, int(cli.motion_time * 60.0))   # 60 Hz physics
+
     for idx, (label, angles_deg) in enumerate(TEST_CONFIGURATIONS, start=1):
         angles_rad = np.array([math.radians(a) for a in angles_deg], dtype=np.float64)
 
         print(f"[{idx}/5] {label}")
         print(f"        Joints: {[f'{a}°' for a in angles_deg]}")
 
-        # Command joint positions (kinematic set — no gravity needed)
-        robot.set_joint_positions(angles_rad)
+        if cli.motion == "smooth":
+            # Cosine-eased blend from previous joint vector to the target,
+            # commanding intermediate joint positions every physics step.
+            for k in range(1, motion_steps + 1):
+                q_cmd = _smooth_blend(q_prev, angles_rad, k / motion_steps)
+                robot.set_joint_positions(q_cmd)
+                world.step(render=True)
+                simulation_app.update()
+        else:
+            robot.set_joint_positions(angles_rad)
+            for _ in range(SETTLE_STEPS):
+                world.step(render=True)
+                simulation_app.update()
 
-        # Step to let the articulation propagate transforms
-        for _ in range(SETTLE_STEPS):
-            world.step(render=True)
-            simulation_app.update()
+        q_prev = angles_rad
 
         # Read world poses
         ee_pos_w,   ee_quat_w   = ee_xform.get_world_pose()
@@ -388,7 +589,7 @@ def main() -> None:
         print(f"        Sim (mm) X={sim_pos_mm[0]:8.2f}  Y={sim_pos_mm[1]:8.2f}  Z={sim_pos_mm[2]:8.2f}")
         print()
 
-        # Hold the pose so the user can inspect it in the viewport
+        # Hold the pose so it's visible in the viewport
         dwell_steps = max(1, int(cli.dwell * 60))
         for _ in range(dwell_steps):
             world.step(render=True)
@@ -397,7 +598,7 @@ def main() -> None:
     # ── Print full comparison table ───────────────────────────────────────
     _print_table(results)
 
-    # ── Keep the simulation alive — close the window to quit ──────────────
+    # Keep the simulation alive — close the window to quit
     print("[task1b] All configurations shown.  Close the Isaac Sim window to exit.\n")
     while simulation_app.is_running():
         world.step(render=True)
