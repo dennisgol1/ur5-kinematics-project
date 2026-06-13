@@ -101,16 +101,32 @@ from matplotlib.gridspec import GridSpec
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 # ---------------------------------------------------------------------------
-# Waypoints (Cartesian, in the UR5 base frame). Closing back to start so the
-# arm finishes where it began — visually clean for a screenshot.
+# Waypoints (Cartesian, in the UR5 base frame).
+#
+# Five DISTINCT positions: a centre / "home" pose plus four cardinal points
+# on a vertical clock-face (YZ plane at X = 0.40, radius 0.20 m) at angles
+# 0° (right), 90° (up), 180° (left), 270° (down). A sixth entry closes the
+# loop back to centre — so the planner builds five quintic segments and the
+# arm sweeps centre → right → up → left → down → centre.
 # ---------------------------------------------------------------------------
-WAYPOINTS = np.array([
-    [0.40, -0.30, 0.55],   # start (front-left)
-    [0.50,  0.00, 0.65],   # raise + centre
-    [0.40,  0.30, 0.55],   # right + lower
-    [0.30,  0.00, 0.40],   # back + centre + lowest
-    [0.40, -0.30, 0.55],   # back to start
-])
+_CARDINAL_CENTER: np.ndarray = np.array([0.40, 0.00, 0.50])
+_CARDINAL_RADIUS: float = 0.20
+
+
+def _cardinal_waypoints() -> np.ndarray:
+    """5 distinct points (centre + 4 cardinals) + loop close."""
+    cx, cy, cz = _CARDINAL_CENTER
+    r = _CARDINAL_RADIUS
+    pts = [_CARDINAL_CENTER]
+    for deg in (0.0, 90.0, 180.0, 270.0):
+        rad = math.radians(deg)
+        # YZ-plane circle: Y = r cos θ, Z = r sin θ, X constant.
+        pts.append(np.array([cx, cy + r * math.cos(rad), cz + r * math.sin(rad)]))
+    pts.append(_CARDINAL_CENTER)   # close the loop
+    return np.asarray(pts)
+
+
+WAYPOINTS: np.ndarray = _cardinal_waypoints()
 
 # Random sampling box — UR5 has ~0.85 m reach; this stays well inside it.
 RANDOM_BOX_MIN = np.array([0.25, -0.35, 0.30])
