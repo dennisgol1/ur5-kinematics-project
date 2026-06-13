@@ -232,7 +232,18 @@ def _world_to_base(
 # Comparison table printer
 # ---------------------------------------------------------------------------
 
-_C = 16  # numeric column width
+_C           = 16   # numeric column width
+_POS_TOL_MM  = 1.0  # position error threshold (mm)
+_RPY_TOL_DEG = 0.5  # angle error threshold (degrees)
+
+_ROW_META: list[tuple[str, bool]] = [
+    ("X (mm)",    False),
+    ("Y (mm)",    False),
+    ("Z (mm)",    False),
+    ("Roll (°)",  True),
+    ("Pitch (°)", True),
+    ("Yaw (°)",   True),
+]
 
 def _print_table(results: list[dict]) -> None:
     sep  = "=" * 78
@@ -249,26 +260,19 @@ def _print_table(results: list[dict]) -> None:
         print(f"  {'':12} {'DH Math':>{_C}}  {'Isaac Sim':>{_C}}  {'|Error|':>{_C}}")
         print(sep2)
 
-        for axis, dv, sv in zip(
-            ["X (mm)", "Y (mm)", "Z (mm)"],
-            r["dh_pos_mm"], r["sim_pos_mm"],
-        ):
-            err  = abs(dv - sv)
-            mark = " ✓" if err < 1.0 else " !"
-            print(f"  {axis:<12} {dv:>{_C}.4f}  {sv:>{_C}.4f}  {err:>{_C}.4f}{mark}")
-
-        for axis, dv, sv in zip(
-            ["Roll (°)", "Pitch (°)", "Yaw (°)"],
-            r["dh_rpy_deg"], r["sim_rpy_deg"],
-        ):
-            err  = abs(dv - sv)
-            err  = min(err, abs(err - 360.0), abs(err + 360.0))   # wrap
-            mark = " ✓" if err < 0.5 else " !"
+        all_dh = (*r["dh_pos_mm"],  *r["dh_rpy_deg"])
+        all_si = (*r["sim_pos_mm"], *r["sim_rpy_deg"])
+        for (axis, is_angle), dv, sv in zip(_ROW_META, all_dh, all_si):
+            err = abs(dv - sv)
+            if is_angle:
+                err = min(err, abs(err - 360.0), abs(err + 360.0))
+            tol  = _RPY_TOL_DEG if is_angle else _POS_TOL_MM
+            mark = " ✓" if err < tol else " !"
             print(f"  {axis:<12} {dv:>{_C}.4f}  {sv:>{_C}.4f}  {err:>{_C}.4f}{mark}")
         print()
 
     print(sep)
-    print("  ✓ pos < 1 mm  |  ✓ angle < 0.5°  |  ! = outside tolerance")
+    print(f"  ✓ pos < {_POS_TOL_MM} mm  |  ✓ angle < {_RPY_TOL_DEG}°  |  ! = outside tolerance")
     print(sep + "\n")
 
 
@@ -355,8 +359,7 @@ def main() -> None:
 
         # Express EE in robot-base frame
         ee_pos_b, ee_quat_b = _world_to_base(
-            np.array(ee_pos_w),   np.array(ee_quat_w),
-            np.array(base_pos_w), np.array(base_quat_w),
+            ee_pos_w, ee_quat_w, base_pos_w, base_quat_w,
         )
 
         sim_pos_mm  = tuple(float(v) * 1000.0 for v in ee_pos_b)
