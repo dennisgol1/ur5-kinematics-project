@@ -63,8 +63,9 @@ simulation_app = SimulationApp(
         "headless": False,
         "width": 1920,
         "height": 1080,
-        "renderer": "RaytracedLighting",
-        "anti_aliasing": 3,
+        # Do not set "renderer" here — Isaac Sim 5.x selects the correct
+        # RTX backend from its own .kit app config.  Forcing
+        # "RaytracedLighting" causes librtx.scenedb to crash on startup.
     }
 )
 
