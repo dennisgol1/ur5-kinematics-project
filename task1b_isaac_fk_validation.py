@@ -63,21 +63,30 @@ simulation_app = SimulationApp({
 # All remaining Isaac Sim / USD imports — AFTER SimulationApp().
 # ---------------------------------------------------------------------------
 import math
-import time
 from pathlib import Path
 
 import numpy as np
 import omni.timeline
 import omni.usd
-from pxr import Gf, Sdf, UsdGeom
+from pxr import Gf, UsdGeom
 
 import isaacsim.core.experimental.utils.stage as stage_utils
-from isaacsim.core.experimental.objects import (
-    Cube, DistantLight, DomeLight, GroundPlane,
+from isaacsim.core.experimental.objects import GroundPlane
+from isaacsim.core.experimental.prims import Articulation
+from isaacsim.core.simulation_manager import SimulationManager  # noqa: F401
+
+from ur5_scene import (
+    BASE_PRIM_PATH,
+    ROBOT_BASE_Z,
+    ROBOT_NAME,
+    ROBOT_PRIM_PATH,
+    TABLE_HEIGHT,
+    build_desk,
+    build_lights,
+    find_ee_prim,
+    make_step_pacer,
+    resolve_ur5_usd,
 )
-from isaacsim.core.experimental.prims import Articulation, XformPrim
-from isaacsim.core.simulation_manager import SimulationManager
-from isaacsim.storage.native import get_assets_root_path
 
 # Re-use FK math + test configs from Task 1.
 sys.path.insert(0, str(Path(__file__).parent))
@@ -88,60 +97,14 @@ from task1_fk_validation import (
 )
 
 # ---------------------------------------------------------------------------
-# Scene constants
+# Local constants (scene constants/builders live in ur5_scene.py)
 # ---------------------------------------------------------------------------
-UR5_USD_LOCAL_PATH: str | None = None        # set to a local .usd to skip S3
-
-TABLE_WIDTH:        float = 1.50
-TABLE_DEPTH:        float = 1.20
-TABLE_HEIGHT:       float = 0.75
-DESK_TOP_THICKNESS: float = 0.05
-DESK_LEG_THICKNESS: float = 0.07
-DESK_LEG_INSET:     float = 0.05
-
-ROBOT_BASE_Z: float = TABLE_HEIGHT
-
-ROBOT_PRIM_PATH = "/World/UR5"
-ROBOT_NAME      = "ur5"
-
-EE_CANDIDATE_PRIMS = [
-    f"{ROBOT_PRIM_PATH}/ee_link",
-    f"{ROBOT_PRIM_PATH}/tool0",
-    f"{ROBOT_PRIM_PATH}/wrist_3_link",
-]
-BASE_PRIM_PATH = f"{ROBOT_PRIM_PATH}/base_link"
-
 SETTLE_STEPS = 60   # 1 s at 60 Hz
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def _resolve_usd() -> str:
-    if UR5_USD_LOCAL_PATH:
-        p = Path(UR5_USD_LOCAL_PATH)
-        if not p.exists():
-            raise FileNotFoundError(f"Local USD not found: {UR5_USD_LOCAL_PATH}")
-        return str(p.resolve())
-    root = get_assets_root_path()
-    if root is None:
-        raise RuntimeError(
-            "Omniverse Nucleus / S3 not reachable; "
-            "set UR5_USD_LOCAL_PATH to a local UR5 USD instead."
-        )
-    return f"{root}/Isaac/Robots/UniversalRobots/ur5/ur5.usd"
-
-
-def _find_ee_prim(stage) -> str:
-    for path in EE_CANDIDATE_PRIMS:
-        if stage.GetPrimAtPath(path).IsValid():
-            return path
-    raise RuntimeError(
-        "Cannot find the EE prim. Expected one of:\n"
-        + "\n".join(f"  {p}" for p in EE_CANDIDATE_PRIMS)
-    )
-
-
 def _smooth_blend(
     q_start: np.ndarray, q_end: np.ndarray, alpha: float,
 ) -> np.ndarray:
@@ -233,77 +196,6 @@ def _quat_wxyz_to_rpy(q: np.ndarray) -> tuple[float, float, float]:
 
 
 # ---------------------------------------------------------------------------
-# Scene builders — RTX renders MDL natively so we only set colors/materials
-# where we author geometry ourselves (the desk).
-# ---------------------------------------------------------------------------
-def _build_lights() -> None:
-    """Sky dome + warm key sun + cool fill (no overrides on the UR5)."""
-    sky = DomeLight(paths="/World/Lights/Sky")
-    sky.set_intensities([800.0])
-    sky.set_colors([[0.92, 0.95, 1.00]])
-
-    sun = DistantLight(
-        paths="/World/Lights/Sun",
-        angles=[2.0],
-        orientations=np.array([[0.6532815, -0.2705981, 0.6532815, -0.2705981]]),
-    )
-    sun.set_intensities([3000.0])
-    sun.set_colors([[1.00, 0.96, 0.88]])
-
-    fill = DistantLight(
-        paths="/World/Lights/Fill",
-        angles=[5.0],
-        orientations=np.array([[0.5, -0.5, -0.5, 0.5]]),
-    )
-    fill.set_intensities([600.0])
-    fill.set_colors([[0.85, 0.90, 1.00]])
-    print("[task1b] lights placed (dome + sun + fill)")
-
-
-def _build_desk(stage) -> None:
-    """Single Cube for the top + four Cube legs, all in warm wood color.
-
-    ``Cube`` from ``isaacsim.core.experimental.objects`` wraps ``UsdGeom.Cube``
-    whose ``size`` attribute defaults to **2** (USD spec). Without passing
-    ``sizes=[1.0]`` the ``scales`` values get doubled, so a 5 cm-tall slab
-    becomes 10 cm tall, etc. — which is what produced legs poking through
-    the desk top in the last run.
-    """
-    Cube(
-        paths="/World/Desk/Top",
-        sizes=[1.0],
-        positions=np.array([[0.0, 0.0, TABLE_HEIGHT - DESK_TOP_THICKNESS / 2.0]]),
-        scales=np.array([[TABLE_WIDTH, TABLE_DEPTH, DESK_TOP_THICKNESS]]),
-    )
-    half_x = TABLE_WIDTH  / 2.0 - DESK_LEG_INSET - DESK_LEG_THICKNESS / 2.0
-    half_y = TABLE_DEPTH  / 2.0 - DESK_LEG_INSET - DESK_LEG_THICKNESS / 2.0
-    leg_h  = TABLE_HEIGHT - DESK_TOP_THICKNESS
-    leg_z  = leg_h / 2.0
-    for i, (sx, sy) in enumerate(
-        [(+1, +1), (+1, -1), (-1, +1), (-1, -1)]
-    ):
-        Cube(
-            paths=f"/World/Desk/Leg_{i}",
-            sizes=[1.0],
-            positions=np.array([[sx * half_x, sy * half_y, leg_z]]),
-            scales=np.array([[DESK_LEG_THICKNESS, DESK_LEG_THICKNESS, leg_h]]),
-        )
-
-    # Paint wood color via USD primvar on the underlying meshes — works in
-    # both RTX (fallback colour) and Storm (primary colour) without a
-    # full UsdShade material graph.
-    from pxr import UsdShade
-    for prim in stage.Traverse():
-        if prim.GetPath().pathString.startswith("/World/Desk/"):
-            if UsdGeom.Gprim(prim):
-                disp = UsdGeom.Gprim(prim).CreateDisplayColorPrimvar(
-                    UsdGeom.Tokens.constant
-                )
-                disp.Set([Gf.Vec3f(0.55, 0.35, 0.18)])
-    print("[task1b] desk built (1 top + 4 legs)")
-
-
-# ---------------------------------------------------------------------------
 # Comparison-table printer (unchanged)
 # ---------------------------------------------------------------------------
 _C          = 16
@@ -356,7 +248,7 @@ def main() -> None:
     global Usd
     from pxr import Usd                  # imported here so it's after SimulationApp
 
-    usd_path = _resolve_usd()
+    usd_path = resolve_ur5_usd()
     print(f"\n[task1b] UR5 asset: {usd_path}")
     print(f"[task1b] Desk height: {TABLE_HEIGHT} m -- robot base at "
           f"z = {ROBOT_BASE_Z} m\n")
@@ -365,8 +257,8 @@ def main() -> None:
 
     # ---- Scene -----------------------------------------------------------
     GroundPlane(paths="/World/Ground")
-    _build_lights()
-    _build_desk(stage)
+    build_lights()
+    build_desk(stage)
 
     stage_utils.add_reference_to_stage(usd_path=usd_path, path=ROBOT_PRIM_PATH)
 
@@ -386,7 +278,7 @@ def main() -> None:
           f"{articulation.num_links} links")
 
     # Locate EE prim now that the stage is loaded.
-    ee_prim_path = _find_ee_prim(stage)
+    ee_prim_path = find_ee_prim(stage)
     base_path = (
         BASE_PRIM_PATH
         if stage.GetPrimAtPath(BASE_PRIM_PATH).IsValid()
@@ -400,17 +292,9 @@ def main() -> None:
     def _cmd(q: np.ndarray) -> None:
         articulation.set_dof_positions(q.reshape(1, -1).astype(np.float32))
 
-    # simulation_app.update() does NOT throttle to physics rate in 6.0 — left
-    # unpaced, a 120-step interpolation can complete in <0.2 s and read as a
-    # snap. Pace each step to ~60 Hz so the motion is visible.
-    _DT = 1.0 / 60.0
-
-    def _step() -> None:
-        t = time.perf_counter()
-        simulation_app.update()
-        slack = _DT - (time.perf_counter() - t)
-        if slack > 0.0:
-            time.sleep(slack)
+    # simulation_app.update() doesn't throttle to physics rate in 6.0 — pace
+    # each call to ~60 Hz so the motion is visible.
+    _step = make_step_pacer(simulation_app)
 
     raw = articulation.get_dof_positions()
     q_prev = np.asarray(
