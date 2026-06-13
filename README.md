@@ -23,7 +23,11 @@ Isaac Sim 5.1.0 is required for Task 5 (simulation). Tasks 1–4 run on plain Py
 ## Task 1 — Forward Kinematics
 
 ```bash
+# Pure math — runs on plain Python 3
 python3 task1_fk_validation.py
+
+# Isaac Sim validation
+~/Simulators/isaacsim/python.sh task1b_isaac_fk_validation.py
 ```
 
 Computes the end-effector pose for 5 joint configurations using the standard DH convention and prints position (X, Y, Z) and orientation (Roll, Pitch, Yaw).

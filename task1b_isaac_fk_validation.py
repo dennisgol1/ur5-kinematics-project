@@ -19,12 +19,10 @@ What it does
 
 Usage
 -----
-    ~/.local/share/ov/pkg/isaac-sim-5.1.0/python.sh \\
-        task1b_isaac_fk_validation.py
+    ~/Simulators/isaacsim/python.sh task1b_isaac_fk_validation.py
 
     # Slower dwell (default 3 s per config):
-    ~/.local/share/ov/pkg/isaac-sim-5.1.0/python.sh \\
-        task1b_isaac_fk_validation.py --dwell 5
+    ~/Simulators/isaacsim/python.sh task1b_isaac_fk_validation.py --dwell 5
 
 Notes
 -----
