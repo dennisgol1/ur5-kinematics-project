@@ -86,6 +86,7 @@ from ur5_scene import (
     make_step_pacer,
     place_robot_on_desk,
     resolve_ur5_usd,
+    set_camera_view,
 )
 
 # Re-use FK math + test configs from Task 1.
@@ -244,7 +245,23 @@ def _print_table(results: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _print_version_banner(tag: str) -> None:
+    import subprocess
+    here = Path(__file__).resolve()
+    sha = "<no git>"
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=here.parent, stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        pass
+    print(f"[{tag}] file : {here}")
+    print(f"[{tag}] git  : {sha}")
+
+
 def main() -> None:
+    _print_version_banner("task1b")
     global Usd
     from pxr import Usd                  # imported here so it's after SimulationApp
 
@@ -259,16 +276,19 @@ def main() -> None:
     GroundPlane(paths="/World/Ground")
     build_lights()
     build_desk(stage)
+    set_camera_view(stage)
 
     stage_utils.add_reference_to_stage(usd_path=usd_path, path=ROBOT_PRIM_PATH)
 
-    # Position UR5 so its base sits flush on the desk top.
-    place_robot_on_desk(stage, ROBOT_PRIM_PATH, TABLE_HEIGHT)
-
     # ---- Simulation start ------------------------------------------------
     omni.timeline.get_timeline_interface().play()
-    for _ in range(3):
-        simulation_app.update()
+
+    # Place the UR5 after the sim has warmed up so the bbox query sees
+    # the fully-resolved instance proxies inside the USD.
+    place_robot_on_desk(
+        stage, ROBOT_PRIM_PATH, TABLE_HEIGHT,
+        simulation_app=simulation_app, warmup_frames=10,
+    )
 
     articulation = Articulation(paths=ROBOT_PRIM_PATH)
     print(f"[task1b] UR5 articulation: {articulation.num_joints} joints, "

@@ -41,8 +41,9 @@ _parser.add_argument("--motion-time", type=float, default=8.0,
                      help="Total trajectory time across all segments (default 8.0)")
 _parser.add_argument("--dwell-end",   type=float, default=2.0,
                      help="Seconds to hold the final pose (default 2.0)")
-_parser.add_argument("--samples-per-segment", type=int, default=80,
-                     help="Trajectory samples per segment (default 80)")
+_parser.add_argument("--samples-per-segment", type=int, default=None,
+                     help="Trajectory samples per segment (auto-sized so "
+                          "wall-clock = motion-time when omitted)")
 _parser.add_argument("--dashboard", choices=("live", "off"), default="live",
                      help="Live (default) or off")
 _parser.add_argument("--random", type=int, default=0,
@@ -85,8 +86,10 @@ from ur5_scene import (
     build_desk,
     build_lights,
     make_step_pacer,
+    pin_articulation_pose,
     place_robot_on_desk,
     resolve_ur5_usd,
+    set_camera_view,
 )
 from task2_trajectory_planner import (
     fk_chain,
@@ -110,8 +113,12 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 # loop back to centre — so the planner builds five quintic segments and the
 # arm sweeps centre → right → up → left → down → centre.
 # ---------------------------------------------------------------------------
-_CARDINAL_CENTER: np.ndarray = np.array([0.40, 0.00, 0.50])
-_CARDINAL_RADIUS: float = 0.20
+# Centre lifted from 0.50 -> 0.55 and radius trimmed 0.20 -> 0.18 so all five
+# waypoints (centre + 4 cardinals) stay comfortably inside the UR5's 0.85 m
+# reach envelope while keeping the lowest point (270 deg "down") well above
+# the desk top — the lower arm no longer sweeps into the wood mid-segment.
+_CARDINAL_CENTER: np.ndarray = np.array([0.40, 0.00, 0.55])
+_CARDINAL_RADIUS: float = 0.18
 
 
 def _cardinal_waypoints() -> np.ndarray:
@@ -451,15 +458,46 @@ def _log_cardinal_angles(waypoints: np.ndarray) -> None:
         print(f"   #{i}  {label}  at ({p[0]:+.2f}, {p[1]:+.2f}, {p[2]:+.2f}) m")
 
 
+def _print_version_banner(tag: str) -> None:
+    """Print which file is loaded and which git commit it came from.
+
+    Rules out the "running a stale build" possibility in one glance.
+    """
+    import subprocess
+    here = Path(__file__).resolve()
+    sha = "<no git>"
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=here.parent, stderr=subprocess.DEVNULL,
+        ).decode().strip()
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        pass
+    print(f"[{tag}] file : {here}")
+    print(f"[{tag}] git  : {sha}")
+
+
 def main() -> None:
+    _print_version_banner("task5")
     waypoints = resolve_waypoints()
     _log_cardinal_angles(waypoints)
+
+    # Auto-size samples_per_segment so wall-clock playback ≈ motion-time.
+    # The streaming loop runs at 60 Hz, so total_samples = motion_time × 60
+    # → samples_per_segment = motion_time × 60 / N_seg.
+    n_seg = waypoints.shape[0] - 1
+    samples_per_seg = cli.samples_per_segment
+    if samples_per_seg is None:
+        samples_per_seg = max(20, int(round(cli.motion_time * 60.0 / n_seg)))
+        print(f"[task5] samples/seg auto-sized to {samples_per_seg} "
+              f"({n_seg} seg * {samples_per_seg} / 60 Hz ≈ "
+              f"{n_seg * samples_per_seg / 60.0:.1f} s wall-clock)")
     print(f"[task5] planning quintic path through {waypoints.shape[0]} "
           f"waypoints over {cli.motion_time:.1f} s "
-          f"({cli.samples_per_segment} samples/segment)")
+          f"({samples_per_seg} samples/segment)")
 
     t, positions, _vel, speed = multi_segment_trajectory(
-        waypoints, cli.motion_time, cli.samples_per_segment,
+        waypoints, cli.motion_time, samples_per_seg,
     )
     joints = solve_joint_path(positions, Q_INIT)
 
@@ -476,20 +514,31 @@ def main() -> None:
     GroundPlane(paths="/World/Ground")
     build_lights()
     build_desk(stage)
+    set_camera_view(stage)
 
     usd_path = resolve_ur5_usd()
     print(f"[task5] UR5 asset       : {usd_path}")
     stage_utils.add_reference_to_stage(usd_path=usd_path, path=ROBOT_PRIM_PATH)
 
-    # Place the UR5 so the base sits flush on the desk top (no clipping).
-    place_robot_on_desk(stage, ROBOT_PRIM_PATH, _DESK_TOP_Z)
-
     omni.timeline.get_timeline_interface().play()
-    for _ in range(3):
-        simulation_app.update()
+
+    # Place the UR5 after the sim has warmed up so the bbox query sees
+    # the fully-resolved instance proxies (the cylindrical base lives
+    # inside one and the cache otherwise misses ~40 mm of its extent).
+    applied_z = place_robot_on_desk(
+        stage, ROBOT_PRIM_PATH, _DESK_TOP_Z,
+        simulation_app=simulation_app, warmup_frames=10,
+    )
 
     articulation = Articulation(paths=ROBOT_PRIM_PATH)
     print(f"[task5] UR5 articulation: {articulation.num_joints} joints")
+
+    # Belt + suspenders: re-pin the root via the physics API so PhysX
+    # honours the Z we just authored on the USD. Defends against the
+    # case where the articulation initializer overrides the Xform.
+    pin_articulation_pose(articulation, applied_z)
+    for _ in range(2):
+        simulation_app.update()
 
     step = make_step_pacer(simulation_app)
 

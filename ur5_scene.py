@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 from isaacsim.core.experimental.objects import Cube, DistantLight, DomeLight
 from isaacsim.storage.native import get_assets_root_path
-from pxr import Gf, Usd, UsdGeom
+from pxr import Gf, Usd, UsdGeom, UsdPhysics
 
 # ---------------------------------------------------------------------------
 # USD asset source — set to a local .usd to skip the S3 stream
@@ -90,39 +90,111 @@ def resolve_ur5_usd() -> str:
 BASE_VERTICAL_OFFSET_FALLBACK: float = 0.089   # UR5 DH d1 (m) — used if bbox fails
 
 
-def place_robot_on_desk(stage, robot_prim_path: str, desk_top_z: float) -> float:
+def place_robot_on_desk(
+    stage,
+    robot_prim_path: str,
+    desk_top_z: float,
+    simulation_app=None,
+    warmup_frames: int = 10,
+) -> float:
     """Translate the robot so its geometry sits flush on ``desk_top_z``.
 
-    Queries the local-space bounding box of ``robot_prim_path``; the
-    Z-min of that box is *negative* for any USD whose prim origin sits
-    above the bottom of the visible geometry. We set the Xform translate
-    to ``desk_top_z - z_min`` so that ``origin + z_min`` lands exactly on
-    the desk surface. Returns the actual Z translate applied so the
-    caller can log it.
+    NVIDIA's UR5 USD uses heavy instancing — the cylindrical base sits
+    inside an instance, so ``UsdGeom.BBoxCache.ComputeLocalBound`` (which
+    walks the direct prim hierarchy) under-reports the geometry extent
+    by ~40 mm. Two compensations:
+
+    1. If a ``simulation_app`` is passed, pump ``warmup_frames`` updates
+       first so payloads and instance proxies fully resolve before we
+       query the bbox.
+    2. Take ``z_min = min(bbox_z_min, -BASE_VERTICAL_OFFSET_FALLBACK)``
+       so we always lift by at least the UR5 DH ``d1`` (~89 mm) — that's
+       the spec-correct base-to-shoulder distance and a safe lower bound
+       for the visible base height.
+
+    Returns the actual Z translate applied (logged to stdout for proof).
     """
+    if simulation_app is not None:
+        for _ in range(warmup_frames):
+            simulation_app.update()
+
     robot_prim = stage.GetPrimAtPath(robot_prim_path)
     bbox_cache = UsdGeom.BBoxCache(
         Usd.TimeCode.Default(),
-        includedPurposes=[UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+        includedPurposes=[
+            UsdGeom.Tokens.default_,
+            UsdGeom.Tokens.render,
+            UsdGeom.Tokens.proxy,
+            UsdGeom.Tokens.guide,
+        ],
+        useExtentsHint=True,
     )
     local_box = bbox_cache.ComputeLocalBound(robot_prim).ComputeAlignedBox()
-    z_min = float(local_box.GetMin()[2])
+    bbox_z_min = float(local_box.GetMin()[2])
+    if not np.isfinite(bbox_z_min):
+        bbox_z_min = 0.0   # treat NaN/inf as "no info"
 
-    # If the bbox query returned something obviously broken (cache not
-    # warmed up, payloads still loading, etc.) fall back to the DH d1
-    # offset for UR5 — empirically the right ballpark for this USD.
-    if not np.isfinite(z_min) or z_min >= 0.0:
-        z_min = -BASE_VERTICAL_OFFSET_FALLBACK
-        print(f"[ur5_scene] bbox z_min unreliable; using fallback offset "
-              f"{BASE_VERTICAL_OFFSET_FALLBACK} m")
-
+    z_min = min(bbox_z_min, -BASE_VERTICAL_OFFSET_FALLBACK)
     z_translate = desk_top_z - z_min
+
     xf = UsdGeom.Xformable(robot_prim)
     xf.ClearXformOpOrder()
     xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, z_translate))
-    print(f"[ur5_scene] robot placed at z = {z_translate:.4f} m "
-          f"(local z_min = {z_min:+.4f} m)")
+    print(f"[ur5_scene] robot placed at z = {z_translate:.4f} m  "
+          f"(bbox z_min = {bbox_z_min:+.4f} m, "
+          f"fallback = -{BASE_VERTICAL_OFFSET_FALLBACK:.4f} m, "
+          f"used = {z_min:+.4f} m)")
     return z_translate
+
+
+# ---------------------------------------------------------------------------
+# Viewport camera — close-up of the desk + UR5
+# ---------------------------------------------------------------------------
+DEFAULT_CAMERA_EYE:    tuple[float, float, float] = (1.4, -1.2, 1.25)
+DEFAULT_CAMERA_TARGET: tuple[float, float, float] = (0.40,  0.00, 0.95)
+
+
+def set_camera_view(
+    stage,
+    eye:    tuple[float, float, float] = DEFAULT_CAMERA_EYE,
+    target: tuple[float, float, float] = DEFAULT_CAMERA_TARGET,
+    up:     tuple[float, float, float] = (0.0, 0.0, 1.0),
+    camera_path: str = "/OmniverseKit_Persp",
+) -> None:
+    """Point the perspective viewport camera at ``target`` from ``eye``.
+
+    Uses ``Gf.Matrix4d.SetLookAt`` for the view matrix, then inverts it to
+    get the camera's world transform, and authors a single transformOp on
+    the camera prim. Works without depending on any helper that was
+    renamed during the Isaac Sim 5 → 6 API rewrite.
+    """
+    view = Gf.Matrix4d()
+    view.SetLookAt(Gf.Vec3d(*eye), Gf.Vec3d(*target), Gf.Vec3d(*up))
+    cam_prim = stage.GetPrimAtPath(camera_path)
+    if not cam_prim.IsValid():
+        print(f"[ur5_scene] camera prim {camera_path} not found; skipping view set")
+        return
+    xf = UsdGeom.Xformable(cam_prim)
+    xf.ClearXformOpOrder()
+    xf.AddTransformOp().Set(view.GetInverse())
+    print(f"[ur5_scene] viewport camera  eye=({eye[0]:.2f},{eye[1]:+.2f},{eye[2]:.2f})  "
+          f"target=({target[0]:.2f},{target[1]:+.2f},{target[2]:.2f})")
+
+
+# ---------------------------------------------------------------------------
+# Articulation root pin — defends against USD-authored xform overrides
+# ---------------------------------------------------------------------------
+def pin_articulation_pose(articulation, z_world: float) -> None:
+    """Force the articulation root to ``(0, 0, z_world)`` via the physics API.
+
+    Without this, the PhysX articulation initializer reads the USD's
+    authored xform — which may not match the translate we just set with
+    ``UsdGeom.Xformable``. Setting through the articulation API anchors
+    the physics root to our chosen Z and keeps the base flush on the desk.
+    """
+    pos = np.array([[0.0, 0.0, float(z_world)]], dtype=np.float32)
+    articulation.set_world_poses(positions=pos)
+    print(f"[ur5_scene] articulation root pinned at world z = {z_world:.4f} m")
 
 
 def find_ee_prim(stage) -> str:
@@ -164,12 +236,33 @@ def build_lights() -> None:
     print("[ur5_scene] lights placed (dome + sun + fill)")
 
 
+def _apply_static_collision(stage, prim_path: str) -> None:
+    """Make a prim a static PhysX collider (kinematic rigid body + collision).
+
+    Matches the reference repo's `_apply_static_collision` pattern: a
+    `UsdPhysics.CollisionAPI` for the contact surface plus a
+    `UsdPhysics.RigidBodyAPI` with `kinematicEnabled = True` so the body
+    does not fall under gravity but other rigid bodies still bounce off it.
+    """
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        return
+    UsdPhysics.CollisionAPI.Apply(prim)
+    rb_api = UsdPhysics.RigidBodyAPI.Apply(prim)
+    rb_api.CreateKinematicEnabledAttr(True)
+
+
 def build_desk(stage) -> None:
     """Single Cube for the top + four Cube legs, all in warm wood color.
 
     ``Cube`` from ``isaacsim.core.experimental.objects`` wraps ``UsdGeom.Cube``
     whose ``size`` attribute defaults to **2** (USD spec). Pass ``sizes=[1.0]``
     so ``scales`` reads as actual metres.
+
+    Each desk component is given a PhysX **static collider** so the UR5
+    physically collides with the wood instead of passing through it
+    (CollisionAPI + kinematic RigidBodyAPI, same pattern as the
+    reference repo's ``_apply_static_collision``).
     """
     Cube(
         paths="/World/Desk/Top",
@@ -196,4 +289,9 @@ def build_desk(stage) -> None:
                     UsdGeom.Tokens.constant
                 )
                 disp.Set([Gf.Vec3f(0.55, 0.35, 0.18)])
-    print("[ur5_scene] desk built (1 top + 4 legs)")
+
+    # ---- physics: every desk piece becomes a static collider -----------
+    _apply_static_collision(stage, "/World/Desk/Top")
+    for i in range(4):
+        _apply_static_collision(stage, f"/World/Desk/Leg_{i}")
+    print("[ur5_scene] desk built (1 top + 4 legs, all kinematic colliders)")
