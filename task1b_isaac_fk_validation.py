@@ -68,7 +68,7 @@ from pathlib import Path
 import numpy as np
 import omni.timeline
 import omni.usd
-from pxr import Gf, UsdGeom
+from pxr import UsdGeom
 
 import isaacsim.core.experimental.utils.stage as stage_utils
 from isaacsim.core.experimental.objects import GroundPlane
@@ -77,7 +77,6 @@ from isaacsim.core.simulation_manager import SimulationManager  # noqa: F401
 
 from ur5_scene import (
     BASE_PRIM_PATH,
-    ROBOT_BASE_Z,
     ROBOT_NAME,
     ROBOT_PRIM_PATH,
     TABLE_HEIGHT,
@@ -85,6 +84,7 @@ from ur5_scene import (
     build_lights,
     find_ee_prim,
     make_step_pacer,
+    place_robot_on_desk,
     resolve_ur5_usd,
 )
 
@@ -251,7 +251,7 @@ def main() -> None:
     usd_path = resolve_ur5_usd()
     print(f"\n[task1b] UR5 asset: {usd_path}")
     print(f"[task1b] Desk height: {TABLE_HEIGHT} m -- robot base at "
-          f"z = {ROBOT_BASE_Z} m\n")
+          f"z = {TABLE_HEIGHT} m\n")
 
     stage = omni.usd.get_context().get_stage()
 
@@ -262,11 +262,8 @@ def main() -> None:
 
     stage_utils.add_reference_to_stage(usd_path=usd_path, path=ROBOT_PRIM_PATH)
 
-    # Position UR5 base on the desk.
-    robot_prim = stage.GetPrimAtPath(ROBOT_PRIM_PATH)
-    xf = UsdGeom.Xformable(robot_prim)
-    xf.ClearXformOpOrder()
-    xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, ROBOT_BASE_Z))
+    # Position UR5 so its base sits flush on the desk top.
+    place_robot_on_desk(stage, ROBOT_PRIM_PATH, TABLE_HEIGHT)
 
     # ---- Simulation start ------------------------------------------------
     omni.timeline.get_timeline_interface().play()

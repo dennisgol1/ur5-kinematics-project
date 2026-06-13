@@ -72,7 +72,7 @@ import math
 import numpy as np
 import omni.timeline
 import omni.usd
-from pxr import Gf, UsdGeom
+from pxr import UsdGeom  # noqa: F401  (kept for future xform helpers)
 
 import isaacsim.core.experimental.utils.stage as stage_utils
 from isaacsim.core.experimental.objects import GroundPlane
@@ -80,11 +80,12 @@ from isaacsim.core.experimental.prims import Articulation
 
 sys.path.insert(0, str(Path(__file__).parent))
 from ur5_scene import (
-    ROBOT_BASE_Z,
     ROBOT_PRIM_PATH,
+    TABLE_HEIGHT as _DESK_TOP_Z,
     build_desk,
     build_lights,
     make_step_pacer,
+    place_robot_on_desk,
     resolve_ur5_usd,
 )
 from task2_trajectory_planner import (
@@ -429,8 +430,30 @@ def _flush_dashboard(artists: dict) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+def _log_cardinal_angles(waypoints: np.ndarray) -> None:
+    """Print each waypoint's angle around the cardinal centre in the YZ plane.
+
+    Confirms the waypoints really do sit at 0 deg / 90 deg / 180 deg / 270 deg
+    relative to ``_CARDINAL_CENTER``. The numbers shown are *Cartesian-space*
+    bearings (atan2 of the Y/Z offset) — they are NOT robot joint angles,
+    which are six independent values per pose solved by IK.
+    """
+    cy, cz = float(_CARDINAL_CENTER[1]), float(_CARDINAL_CENTER[2])
+    print("[task5] waypoint cardinal-angle verification "
+          "(YZ-plane, measured from centre):")
+    for i, p in enumerate(waypoints):
+        dy, dz = float(p[1]) - cy, float(p[2]) - cz
+        if dy == 0.0 and dz == 0.0:
+            label = "centre"
+        else:
+            ang = math.degrees(math.atan2(dz, dy)) % 360.0
+            label = f"{ang:6.1f}°"
+        print(f"   #{i}  {label}  at ({p[0]:+.2f}, {p[1]:+.2f}, {p[2]:+.2f}) m")
+
+
 def main() -> None:
     waypoints = resolve_waypoints()
+    _log_cardinal_angles(waypoints)
     print(f"[task5] planning quintic path through {waypoints.shape[0]} "
           f"waypoints over {cli.motion_time:.1f} s "
           f"({cli.samples_per_segment} samples/segment)")
@@ -458,10 +481,8 @@ def main() -> None:
     print(f"[task5] UR5 asset       : {usd_path}")
     stage_utils.add_reference_to_stage(usd_path=usd_path, path=ROBOT_PRIM_PATH)
 
-    robot_prim = stage.GetPrimAtPath(ROBOT_PRIM_PATH)
-    xf = UsdGeom.Xformable(robot_prim)
-    xf.ClearXformOpOrder()
-    xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, ROBOT_BASE_Z))
+    # Place the UR5 so the base sits flush on the desk top (no clipping).
+    place_robot_on_desk(stage, ROBOT_PRIM_PATH, _DESK_TOP_Z)
 
     omni.timeline.get_timeline_interface().play()
     for _ in range(3):

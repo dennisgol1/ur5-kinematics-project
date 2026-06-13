@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 from isaacsim.core.experimental.objects import Cube, DistantLight, DomeLight
 from isaacsim.storage.native import get_assets_root_path
-from pxr import Gf, UsdGeom
+from pxr import Gf, Usd, UsdGeom
 
 # ---------------------------------------------------------------------------
 # USD asset source — set to a local .usd to skip the S3 stream
@@ -79,6 +79,50 @@ def resolve_ur5_usd() -> str:
             "set UR5_USD_LOCAL_PATH to a local UR5 USD instead."
         )
     return f"{root}/Isaac/Robots/UniversalRobots/ur5/ur5.usd"
+
+
+# ---------------------------------------------------------------------------
+# Robot placement — works around USDs (like NVIDIA's UR5) whose ``base_link``
+# origin sits inside the visible base cylinder instead of at its bottom face.
+# Placing such a USD at ``z = TABLE_HEIGHT`` buries the lower half of the
+# base in the desk; we measure the local Z-min and lift accordingly.
+# ---------------------------------------------------------------------------
+BASE_VERTICAL_OFFSET_FALLBACK: float = 0.089   # UR5 DH d1 (m) — used if bbox fails
+
+
+def place_robot_on_desk(stage, robot_prim_path: str, desk_top_z: float) -> float:
+    """Translate the robot so its geometry sits flush on ``desk_top_z``.
+
+    Queries the local-space bounding box of ``robot_prim_path``; the
+    Z-min of that box is *negative* for any USD whose prim origin sits
+    above the bottom of the visible geometry. We set the Xform translate
+    to ``desk_top_z - z_min`` so that ``origin + z_min`` lands exactly on
+    the desk surface. Returns the actual Z translate applied so the
+    caller can log it.
+    """
+    robot_prim = stage.GetPrimAtPath(robot_prim_path)
+    bbox_cache = UsdGeom.BBoxCache(
+        Usd.TimeCode.Default(),
+        includedPurposes=[UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+    )
+    local_box = bbox_cache.ComputeLocalBound(robot_prim).ComputeAlignedBox()
+    z_min = float(local_box.GetMin()[2])
+
+    # If the bbox query returned something obviously broken (cache not
+    # warmed up, payloads still loading, etc.) fall back to the DH d1
+    # offset for UR5 — empirically the right ballpark for this USD.
+    if not np.isfinite(z_min) or z_min >= 0.0:
+        z_min = -BASE_VERTICAL_OFFSET_FALLBACK
+        print(f"[ur5_scene] bbox z_min unreliable; using fallback offset "
+              f"{BASE_VERTICAL_OFFSET_FALLBACK} m")
+
+    z_translate = desk_top_z - z_min
+    xf = UsdGeom.Xformable(robot_prim)
+    xf.ClearXformOpOrder()
+    xf.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, z_translate))
+    print(f"[ur5_scene] robot placed at z = {z_translate:.4f} m "
+          f"(local z_min = {z_min:+.4f} m)")
+    return z_translate
 
 
 def find_ee_prim(stage) -> str:
