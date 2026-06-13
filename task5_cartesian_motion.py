@@ -37,8 +37,10 @@ _parser = argparse.ArgumentParser(
     description="UR5 multi-waypoint linear Cartesian motion in Isaac Sim 6.0",
     add_help=False,
 )
-_parser.add_argument("--motion-time", type=float, default=8.0,
-                     help="Total trajectory time across all segments (default 8.0)")
+_parser.add_argument("--motion-time", type=float, default=12.0,
+                     help="Total trajectory time across all segments "
+                          "(default 12.0 s — auto-sized samples deliver "
+                          "this in wall-clock too)")
 _parser.add_argument("--dwell-end",   type=float, default=2.0,
                      help="Seconds to hold the final pose (default 2.0)")
 _parser.add_argument("--samples-per-segment", type=int, default=None,

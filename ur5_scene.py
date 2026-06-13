@@ -150,8 +150,8 @@ def place_robot_on_desk(
 # ---------------------------------------------------------------------------
 # Viewport camera — close-up of the desk + UR5
 # ---------------------------------------------------------------------------
-DEFAULT_CAMERA_EYE:    tuple[float, float, float] = (1.4, -1.2, 1.25)
-DEFAULT_CAMERA_TARGET: tuple[float, float, float] = (0.40,  0.00, 0.95)
+DEFAULT_CAMERA_EYE:    tuple[float, float, float] = (1.00, -0.80, 1.10)
+DEFAULT_CAMERA_TARGET: tuple[float, float, float] = (0.40,  0.00, 0.90)
 
 
 def set_camera_view(
