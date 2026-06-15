@@ -150,13 +150,10 @@ def place_robot_on_desk(
 # ---------------------------------------------------------------------------
 # Viewport camera — close-up of the desk + UR5
 # ---------------------------------------------------------------------------
-# Matches the matplotlib dashboard's 3-D panel (elev=30 deg, azim=-60 deg).
-# Camera direction from target toward eye:
-#     ( cos(30) cos(-60), cos(30) sin(-60), sin(30) )
-#   = ( +0.433, -0.750, +0.500 )
-# At distance D = 0.85 m from the desk-top centre.
-DEFAULT_CAMERA_EYE:    tuple[float, float, float] = (0.77, -0.64, 1.18)
-DEFAULT_CAMERA_TARGET: tuple[float, float, float] = (0.40,  0.00, 0.75)
+# Captured live from /OmniverseKit_Persp after the user framed the shot
+# manually in the viewport (Script Editor readout).
+DEFAULT_CAMERA_EYE:    tuple[float, float, float] = ( 0.289,  1.433, 2.217)
+DEFAULT_CAMERA_TARGET: tuple[float, float, float] = (-0.339, -0.351, 0.750)
 
 
 def set_camera_view(
@@ -168,20 +165,37 @@ def set_camera_view(
 ) -> None:
     """Point the perspective viewport camera at ``target`` from ``eye``.
 
-    Uses ``Gf.Matrix4d.SetLookAt`` for the view matrix, then inverts it to
-    get the camera's world transform, and authors a single transformOp on
-    the camera prim. Works without depending on any helper that was
-    renamed during the Isaac Sim 5 → 6 API rewrite.
+    Authoring a raw ``xformOp:transform`` on ``/OmniverseKit_Persp`` is
+    silently overridden by the viewport navigator, which drives the
+    camera through ``omni:kit:centerOfInterest`` + ``ViewportCameraState``.
+    Delegate to the bundled helper that touches both.
     """
-    view = Gf.Matrix4d()
-    view.SetLookAt(Gf.Vec3d(*eye), Gf.Vec3d(*target), Gf.Vec3d(*up))
+    from omni.kit.viewport.utility import get_active_viewport
+    from omni.kit.viewport.utility.camera_state import ViewportCameraState
+    from pxr import Sdf
+
+    viewport_api = get_active_viewport()
+    if viewport_api is None:
+        print("[ur5_scene] no active viewport; skipping camera set")
+        return
+
     cam_prim = stage.GetPrimAtPath(camera_path)
     if not cam_prim.IsValid():
-        print(f"[ur5_scene] camera prim {camera_path} not found; skipping view set")
+        print(f"[ur5_scene] camera prim {camera_path} not found; skipping camera set")
         return
-    xf = UsdGeom.Xformable(cam_prim)
-    xf.ClearXformOpOrder()
-    xf.AddTransformOp().Set(view.GetInverse())
+
+    coi_prop = cam_prim.GetProperty("omni:kit:centerOfInterest")
+    if not coi_prop or not coi_prop.IsValid():
+        cam_prim.CreateAttribute(
+            "omni:kit:centerOfInterest",
+            Sdf.ValueTypeNames.Vector3d,
+            True,
+            Sdf.VariabilityUniform,
+        ).Set(Gf.Vec3d(0, 0, -10))
+
+    cam_state = ViewportCameraState(camera_path, viewport_api)
+    cam_state.set_position_world(Gf.Vec3d(*eye), True)
+    cam_state.set_target_world(Gf.Vec3d(*target), True)
     print(f"[ur5_scene] viewport camera  eye=({eye[0]:.2f},{eye[1]:+.2f},{eye[2]:.2f})  "
           f"target=({target[0]:.2f},{target[1]:+.2f},{target[2]:.2f})")
 
