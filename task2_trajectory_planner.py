@@ -97,6 +97,28 @@ def jacobian_position(q: np.ndarray, eps: float = 1e-6) -> np.ndarray:
     return J
 
 
+def geometric_jacobian(q: np.ndarray) -> np.ndarray:
+    """Analytical 6 x 6 geometric Jacobian via Z_{i-1} x (P_ee - P_{i-1}).
+
+    Rows 0..2 map q_dot to linear EE velocity in the base frame; rows
+    3..5 map q_dot to EE angular velocity in the base frame. UR5 is
+    fully revolute, so every column follows the revolute form:
+
+        J[:3, i] = z_{i-1} x (p_ee - p_{i-1})
+        J[3:, i] = z_{i-1}
+    """
+    chain = fk_chain(q)
+    p_ee = chain[-1][:3, 3]
+    J = np.zeros((6, NUM_DOF))
+    for i in range(NUM_DOF):
+        T_prev = chain[i]
+        z_prev = T_prev[:3, 2]
+        p_prev = T_prev[:3, 3]
+        J[:3, i] = np.cross(z_prev, p_ee - p_prev)
+        J[3:, i] = z_prev
+    return J
+
+
 def ik_solve(
     target: np.ndarray,
     q_init: np.ndarray,

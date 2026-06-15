@@ -97,6 +97,7 @@ from task2_trajectory_planner import (
     fk_chain,
     fk_position,
     generate_trajectory,
+    geometric_jacobian,
     ik_solve,
 )
 
@@ -148,6 +149,14 @@ Q_INIT = np.array([
 
 NUM_DOF = 6
 DASHBOARD_EVERY = 5   # update plots every Nth sim frame (60 Hz / 5 = 12 Hz)
+
+# Static-torque payload: 5 kg gravity load applied at the end-effector
+# expressed as a 6-vector wrench [Fx, Fy, Fz, Mx, My, Mz] in the base frame.
+PAYLOAD_MASS: float = 5.0
+GRAVITY:      float = 9.81
+F_EE_WORLD: np.ndarray = np.array(
+    [0.0, 0.0, -PAYLOAD_MASS * GRAVITY, 0.0, 0.0, 0.0],
+)
 
 # ---------------------------------------------------------------------------
 # Waypoint generation
@@ -264,17 +273,19 @@ def _build_dashboard(
     t:          np.ndarray,
     positions:  np.ndarray,
     speed:      np.ndarray,
+    v_jac_mag:  np.ndarray,
+    tau:        np.ndarray,
     joints:     np.ndarray,
     waypoints:  np.ndarray,
 ) -> tuple[plt.Figure, dict]:
     _set_style()
 
-    fig = plt.figure(figsize=(15.5, 9.5))
+    fig = plt.figure(figsize=(15.5, 12.0))
     gs = GridSpec(
-        3, 2, figure=fig,
-        height_ratios=[3.1, 3.1, 1.1],
-        hspace=0.40, wspace=0.22,
-        left=0.06, right=0.97, top=0.91, bottom=0.05,
+        4, 2, figure=fig,
+        height_ratios=[3.1, 3.1, 3.1, 1.1],
+        hspace=0.42, wspace=0.22,
+        left=0.06, right=0.97, top=0.93, bottom=0.05,
     )
 
     # ---- Panel 1 — 3D: planned path + live arm + EE trace --------------
@@ -319,14 +330,22 @@ def _build_dashboard(
     ax_pos.set_ylabel("position (m)")
     ax_pos.legend(loc="best")
 
-    # ---- Panel 3 — |v| vs time (lines grow) -----------------------------
+    # ---- Panel 3 — |v| vs time (planner curve + Jacobian-check overlay)
     ax_vel = fig.add_subplot(gs[1, 0])
-    ax_vel.set_title("Linear-Velocity Magnitude  ·  per-segment quintic profile")
-    line_v, = ax_vel.plot([], [], color=_PALETTE["v"], linewidth=2.2)
+    ax_vel.set_title(r"Linear-Velocity Magnitude  ·  planner vs $|J(q)\,\dot{q}|$")
+    line_v, = ax_vel.plot(
+        [], [], color=_PALETTE["v"], linewidth=2.4,
+        label=r"$|v|_{\mathrm{planner}}$",
+    )
+    line_v_jac, = ax_vel.plot(
+        [], [], color="#F4A261", linewidth=1.4, linestyle=(0, (4, 3)),
+        label=r"$|J(q)\,\dot{q}|$",
+    )
     ax_vel.set_xlim(t[0], t[-1])
-    ax_vel.set_ylim(*_add_pad(0.0, speed.max()))
+    ax_vel.set_ylim(*_add_pad(0.0, max(speed.max(), v_jac_mag.max())))
     ax_vel.set_xlabel("time (s)")
     ax_vel.set_ylabel(r"$|v|$ (m/s)")
+    ax_vel.legend(loc="upper right")
 
     # Mark segment boundaries with thin vertical guides — *not* a cursor.
     n_seg = waypoints.shape[0] - 1
@@ -351,10 +370,33 @@ def _build_dashboard(
     ax_j.set_ylabel("angle (deg)")
     ax_j.legend(loc="upper right", ncol=3)
 
-    # ---- Panel 5 — equations + parameters (static) ---------------------
-    ax_eq = fig.add_subplot(gs[2, :])
+    # ---- Panel 5 — static joint torques tau_1..tau_6 (full-width row) --
+    ax_tau = fig.add_subplot(gs[2, :])
+    ax_tau.set_title(
+        r"Static Joint Torques  ·  $\boldsymbol{\tau} = J^{T}\mathbf{F}$  "
+        rf"with payload $M={PAYLOAD_MASS:.1f}$ kg at the EE"
+    )
+    torque_lines = []
+    for j in range(NUM_DOF):
+        ln, = ax_tau.plot([], [], color=_PALETTE["j"][j], linewidth=1.7,
+                          label=fr"$\tau_{{{j + 1}}}$")
+        torque_lines.append(ln)
+    ax_tau.set_xlim(t[0], t[-1])
+    ax_tau.set_ylim(*_add_pad(float(tau.min()), float(tau.max())))
+    ax_tau.set_xlabel("time (s)")
+    ax_tau.set_ylabel(r"torque (N$\cdot$m)")
+    ax_tau.legend(loc="upper right", ncol=3)
+    if n_seg > 1:
+        T_per = (t[-1] - t[0]) / n_seg
+        for k in range(1, n_seg):
+            ax_tau.axvline(t[0] + k * T_per, color="#bbb",
+                           linewidth=0.7, linestyle=":")
+
+    # ---- Panel 6 — equations + parameters (static, full-width) ---------
+    ax_eq = fig.add_subplot(gs[3, :])
     ax_eq.axis("off")
     speed_peak = float(speed.max())
+    tau_peak   = float(np.abs(tau).max())
     eqns = "\n".join([
         r"$\mathbf{Multi\!-\!Segment\ Cartesian\ Path:}\quad "
         r"\mathbf{P}(t) = \mathbf{P}_k + (\mathbf{P}_{k+1} - \mathbf{P}_k)\,s_k(t)"
@@ -366,44 +408,59 @@ def _build_dashboard(
         r"\mathbf{q}_{k+1} = \mathbf{q}_k + \alpha\,J^{T}"
         r"(J\,J^{T} + \lambda^{2}\,I)^{-1}"
         r"[\mathbf{p}_{\mathrm{target}} - \mathrm{FK}(\mathbf{q}_k)]$",
+        r"$\mathbf{Geometric\ Jacobian:}\quad "
+        r"J_v^{(i)} = \hat{z}_{i-1}\times(\mathbf{p}_{ee}-\mathbf{p}_{i-1})"
+        r"\qquad J_\omega^{(i)} = \hat{z}_{i-1}"
+        r"\qquad\mathbf{V}_{ee} = J(\mathbf{q})\,\dot{\mathbf{q}}$",
+        r"$\mathbf{Static\ Torque:}\quad "
+        r"\boldsymbol{\tau} = J^{T}\mathbf{F}"
+        r"\qquad \mathbf{F}=[0,\,0,\,-Mg,\,0,\,0,\,0]^{T}$",
         (rf"$N_\mathrm{{wp}}={waypoints.shape[0]}$"
          rf"$\qquad N_\mathrm{{seg}}={n_seg}$"
          rf"$\qquad T={cli.motion_time:.1f}\,\mathrm{{s}}$"
-         rf"$\qquad |v|_\mathrm{{peak}}={speed_peak:.3f}\,\mathrm{{m/s}}$"),
+         rf"$\qquad |v|_\mathrm{{peak}}={speed_peak:.3f}\,\mathrm{{m/s}}$"
+         rf"$\qquad M={PAYLOAD_MASS:.1f}\,\mathrm{{kg}}$"
+         rf"$\qquad \|\boldsymbol{{\tau}}\|_\mathrm{{peak}}={tau_peak:.2f}\,\mathrm{{N\!\cdot\!m}}$"),
     ])
     ax_eq.text(0.5, 0.5, eqns, ha="center", va="center",
-               fontsize=12, linespacing=1.75)
+               fontsize=11.5, linespacing=1.65)
 
     fig.suptitle(
         "UR5 Task 5  ·  Live Multi-Waypoint Cartesian Motion",
         fontsize=15.5, fontweight="semibold", y=0.965,
     )
     artists = {
-        "live_arm":    live_arm,
-        "ee_trace":    ee_trace,
-        "line_x":      line_x,
-        "line_y":      line_y,
-        "line_z":      line_z,
-        "line_v":      line_v,
-        "joint_lines": joint_lines,
+        "live_arm":     live_arm,
+        "ee_trace":     ee_trace,
+        "line_x":       line_x,
+        "line_y":       line_y,
+        "line_z":       line_z,
+        "line_v":       line_v,
+        "line_v_jac":   line_v_jac,
+        "joint_lines":  joint_lines,
+        "torque_lines": torque_lines,
         # rolling data buffers
-        "buf_t":  [],
-        "buf_x":  [],
-        "buf_y":  [],
-        "buf_z":  [],
-        "buf_v":  [],
-        "buf_j":  [[] for _ in range(NUM_DOF)],
-        "buf_ee": ([], [], []),  # (x, y, z) trace
+        "buf_t":     [],
+        "buf_x":     [],
+        "buf_y":     [],
+        "buf_z":     [],
+        "buf_v":     [],
+        "buf_v_jac": [],
+        "buf_j":     [[] for _ in range(NUM_DOF)],
+        "buf_tau":   [[] for _ in range(NUM_DOF)],
+        "buf_ee":    ([], [], []),  # (x, y, z) trace
     }
     return fig, artists
 
 
 def _push_sample(
-    artists: dict,
-    t_i:     float,
-    pos_i:   np.ndarray,
-    speed_i: float,
-    joints_i: np.ndarray,
+    artists:   dict,
+    t_i:       float,
+    pos_i:     np.ndarray,
+    speed_i:   float,
+    v_jac_i:   float,
+    tau_i:     np.ndarray,
+    joints_i:  np.ndarray,
 ) -> None:
     """Append one sample to every line's data buffer."""
     artists["buf_t"].append(t_i)
@@ -411,8 +468,10 @@ def _push_sample(
     artists["buf_y"].append(float(pos_i[1]))
     artists["buf_z"].append(float(pos_i[2]))
     artists["buf_v"].append(float(speed_i))
+    artists["buf_v_jac"].append(float(v_jac_i))
     for j in range(NUM_DOF):
         artists["buf_j"][j].append(math.degrees(float(joints_i[j])))
+        artists["buf_tau"][j].append(float(tau_i[j]))
 
     chain = np.array([T[:3, 3] for T in fk_chain(joints_i)])
     ee = chain[-1]
@@ -431,8 +490,10 @@ def _flush_dashboard(artists: dict) -> None:
     artists["line_y"].set_data(t, artists["buf_y"])
     artists["line_z"].set_data(t, artists["buf_z"])
     artists["line_v"].set_data(t, artists["buf_v"])
+    artists["line_v_jac"].set_data(t, artists["buf_v_jac"])
     for j in range(NUM_DOF):
         artists["joint_lines"][j].set_data(t, artists["buf_j"][j])
+        artists["torque_lines"][j].set_data(t, artists["buf_tau"][j])
     artists["ee_trace"].set_data_3d(*artists["buf_ee"])
 
 
@@ -503,13 +564,30 @@ def main() -> None:
     )
     joints = solve_joint_path(positions, Q_INIT)
 
+    # Joint velocities via numerical derivative of the IK-solved joint path.
+    q_dot = np.gradient(joints, t, axis=0)              # shape (N, 6)
+
+    # Per-sample analytical geometric Jacobian, Jacobian-derived EE linear-
+    # velocity magnitude, and static torque under the 5 kg payload wrench.
+    v_jac_mag = np.zeros(len(t))
+    tau       = np.zeros((len(t), NUM_DOF))
+    for i in range(len(t)):
+        J = geometric_jacobian(joints[i])
+        v_jac_mag[i] = float(np.linalg.norm(J[:3] @ q_dot[i]))
+        tau[i]       = J.T @ F_EE_WORLD
+
     residual = np.array([
         float(np.linalg.norm(fk_position(joints[i]) - positions[i]))
         for i in range(len(t))
     ])
-    print(f"[task5] IK max residual : {residual.max() * 1000:.3f} mm")
-    print(f"[task5] peak EE speed   : {speed.max():.3f} m/s")
-    print(f"[task5] total samples   : {len(t)}")
+    v_mismatch = float(np.max(np.abs(speed - v_jac_mag)))
+    print(f"[task5] IK max residual    : {residual.max() * 1000:.3f} mm")
+    print(f"[task5] peak EE speed      : {speed.max():.3f} m/s")
+    print(f"[task5] |v|_planner vs |J q_dot| max diff : "
+          f"{v_mismatch * 1e6:.2f} um/s")
+    print(f"[task5] peak |tau|         : {float(np.abs(tau).max()):.2f} N*m "
+          f"(payload {PAYLOAD_MASS:.1f} kg)")
+    print(f"[task5] total samples      : {len(t)}")
 
     # ---- Isaac Sim scene -----------------------------------------------
     stage = omni.usd.get_context().get_stage()
@@ -547,7 +625,9 @@ def main() -> None:
     # ---- dashboard ------------------------------------------------------
     fig = artists = None
     if cli.dashboard == "live":
-        fig, artists = _build_dashboard(t, positions, speed, joints, waypoints)
+        fig, artists = _build_dashboard(
+            t, positions, speed, v_jac_mag, tau, joints, waypoints,
+        )
         plt.show(block=False)
         fig.canvas.draw_idle()
         fig.canvas.flush_events()
@@ -561,7 +641,8 @@ def main() -> None:
         )
         if cli.dashboard == "live" and artists is not None:
             _push_sample(artists, float(t[i]), positions[i],
-                         float(speed[i]), joints[i])
+                         float(speed[i]), float(v_jac_mag[i]),
+                         tau[i], joints[i])
             if i % DASHBOARD_EVERY == 0:
                 _flush_dashboard(artists)
                 fig.canvas.draw_idle()
